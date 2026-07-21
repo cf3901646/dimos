@@ -21,12 +21,12 @@ from dimos.core.coordination.blueprints import autoconnect
 from dimos.manipulation.manipulation_module import ManipulationModule
 from dimos.robot.manipulators.common.blueprints import eef_twist_task
 from dimos.robot.manipulators.openyam.config import (
-    make_openyam_hardware,
     make_openyam_model_config,
+    openyam_hardware,
 )
 from dimos.teleop.keyboard.keyboard_teleop_module import KeyboardTeleopModule
 
-_openyam_keyboard_hw = make_openyam_hardware("arm")
+_openyam_keyboard_hw = openyam_hardware("arm")
 _openyam_model = make_openyam_model_config(name="arm")
 
 keyboard_teleop_openyam = autoconnect(
