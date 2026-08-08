@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 from dimos.control.coordinator import ControlCoordinator, TaskConfig
+from dimos.control.teleop_coordinator import TeleopControlCoordinator
 from dimos.core.coordination.blueprints import autoconnect
 from dimos.manipulation.manipulation_module import ManipulationModule
 from dimos.robot.manipulators.a1z.config import (
@@ -63,7 +64,7 @@ _a1z_quest_hw = a1z_hardware("arm")
 _a1z_quest_model = make_a1z_model_config()
 
 coordinator_teleop_a1z = autoconnect(
-    ControlCoordinator.blueprint(
+    TeleopControlCoordinator.blueprint(
         hardware=[_a1z_quest_hw],
         tasks=[
             teleop_ik_task(

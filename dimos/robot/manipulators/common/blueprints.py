@@ -17,13 +17,13 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from pathlib import Path
-from typing import Any
+from typing import Any, TypedDict
 
 from dimos.control.components import HardwareComponent
 from dimos.control.coordinator import ControlCoordinator, TaskConfig
 from dimos.core.coordination.blueprints import Blueprint
 from dimos.manipulation.manipulation_module import ManipulationModule
+from dimos.manipulation.planning.kinematics.config import PinkKinematicsConfig
 from dimos.manipulation.planning.kinematics.pink_ik import PinkIK
 from dimos.manipulation.planning.spec.config import RobotModelConfig
 from dimos.robot.manipulators.common.topics import (
@@ -33,6 +33,14 @@ from dimos.robot.manipulators.common.topics import (
     EEF_TWIST_TASK_NAME,
     trajectory_task_name,
 )
+
+
+class GripperTaskOverrides(TypedDict, total=False):
+    """Optional gripper fields shared by teleop and EEF-twist tasks."""
+
+    gripper_joint: str
+    gripper_open_pos: float
+    gripper_closed_pos: float
 
 
 def trajectory_task(
@@ -79,13 +87,26 @@ def cartesian_ik_task(
 def eef_twist_task(
     hardware: HardwareComponent,
     *,
-    model_path: Path,
-    ee_joint_id: int,
+    robot_model: RobotModelConfig,
+    target_frame: str | None = None,
     name: str = EEF_TWIST_TASK_NAME,
     priority: int = 10,
-    params: dict[str, Any] | None = None,
+    timeout: float = 0.3,
+    max_joint_velocity_rad_s: float = 5.0,
+    max_command_tracking_error_deg: float = 10.0,
+    pink: PinkKinematicsConfig | None = None,
+    params: GripperTaskOverrides | None = None,
 ) -> TaskConfig:
-    task_params: dict[str, Any] = {"model_path": model_path, "ee_joint_id": ee_joint_id}
+    task_params: dict[str, Any] = {
+        "robot_model": robot_model,
+        "timeout": timeout,
+        "max_joint_velocity_rad_s": max_joint_velocity_rad_s,
+        "max_command_tracking_error_deg": max_command_tracking_error_deg,
+    }
+    if target_frame is not None:
+        task_params["target_frame"] = target_frame
+    if pink is not None:
+        task_params["pink"] = pink
     if params:
         task_params.update(params)
     return TaskConfig(
@@ -97,7 +118,7 @@ def eef_twist_task(
     )
 
 
-def quest_teleop_ik_task(
+def teleop_ik_task(
     hardware: HardwareComponent,
     *,
     robot_model: RobotModelConfig,
@@ -117,7 +138,7 @@ def quest_teleop_ik_task(
         task_params.update(params)
     return TaskConfig(
         name=name,
-        type="quest_teleop_ik",
+        type="teleop_ik",
         joint_names=list(joint_names) if joint_names is not None else hardware.joints,
         priority=priority,
         params=task_params,
