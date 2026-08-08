@@ -426,8 +426,24 @@ def _install_fake_roboplan(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture
-def fake_roboplan(monkeypatch: pytest.MonkeyPatch) -> None:
+def fake_roboplan(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    module_names = (
+        "roboplan",
+        "roboplan.core",
+        "roboplan.rrt",
+        "roboplan.cartesian_planning",
+        "dimos.manipulation.planning.world.roboplan_world",
+        "dimos.manipulation.planning.planners.roboplan_planner",
+    )
+    original_modules = {name: sys.modules.get(name) for name in module_names}
     _install_fake_roboplan(monkeypatch)
+    yield
+    for name, module in original_modules.items():
+        if module is None:
+            sys.modules.pop(name, None)
+        else:
+            sys.modules[name] = module
+    _PLANNERS_BY_WORLD.clear()
 
 
 @pytest.fixture
