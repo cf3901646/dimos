@@ -94,7 +94,7 @@ entire session; both hands must engage again before commands resume.
 
 **Axes**: thumbstick X, thumbstick Y, trigger (analog), grip (analog)
 
-**Digital controls**: trigger, grip, touchpad, thumbstick, X/A, Y/B, menu
+**Buttons**: trigger, grip, touchpad, thumbstick, X/A, Y/B, menu
 
 ## File Structure
 
@@ -102,7 +102,7 @@ entire session; both hands must engage again before commands resume.
 quest/
 ├── quest_teleop_module.py   # Base module
 ├── quest_extensions.py      # ArmTeleop, TwistTeleop
-├── quest_types.py           # QuestControllerState + packed Buttons
+├── quest_types.py           # QuestControllerState, Buttons
 ├── blueprints.py
 └── web/static/index.html    # WebXR client
 ```
