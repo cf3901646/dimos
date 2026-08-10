@@ -16,6 +16,7 @@
 
 from pathlib import Path
 
+import numpy as np
 import pytest
 from pytest_mock import MockerFixture
 
@@ -26,6 +27,7 @@ from dimos.control.tasks.pose_target_ik import (
     PinkPoseTargetSolver,
     PoseTargetIKTask,
     PoseTargetIKTaskConfig,
+    _StreamingStepResult,
 )
 from dimos.manipulation.planning.kinematics.pink_solver import _PinkSolverCore
 from dimos.manipulation.planning.spec.config import RobotModelConfig
@@ -132,12 +134,15 @@ def test_pose_target_solver_advances_from_last_command_not_delayed_feedback(
 ) -> None:
     solver = _stateful_solver(mocker)
 
-    def advance(**kwargs: object) -> JointState:
+    def advance(**kwargs: object) -> _StreamingStepResult:
         command = kwargs["command_state"]
         assert isinstance(command, JointState)
-        return JointState(
-            name=list(command.name),
-            position=[position + 0.1 for position in command.position],
+        return _StreamingStepResult(
+            command=JointState(
+                name=list(command.name),
+                position=[position + 0.1 for position in command.position],
+            ),
+            bounded_increment=np.array([0.1, 0.1]),
         )
 
     step = mocker.patch.object(solver, "_step_frame_targets", side_effect=advance)
@@ -153,6 +158,9 @@ def test_pose_target_solver_advances_from_last_command_not_delayed_feedback(
     assert step.call_args_list[0].kwargs["command_state"].position == [0.0, 0.0]
     assert step.call_args_list[1].kwargs["command_state"].position == [0.1, 0.1]
     assert step.call_args_list[1].kwargs["measured_state"].position == [-0.3, -0.3]
+    assert step.call_args_list[1].kwargs["command_increment_history"][0] == pytest.approx(
+        [0.1, 0.1]
+    )
     assert step.call_args_list[1].kwargs["joint_command_filter_cutoff_hz"] == 5.0
     assert step.call_args_list[1].kwargs["joint_velocity_limits_rad_s"] == {}
 
@@ -163,8 +171,14 @@ def test_pose_target_solver_reset_reseeds_from_feedback(mocker: MockerFixture) -
         solver,
         "_step_frame_targets",
         side_effect=[
-            JointState(name=["arm/a", "arm/b"], position=[0.1, 0.1]),
-            JointState(name=["arm/a", "arm/b"], position=[-0.2, -0.2]),
+            _StreamingStepResult(
+                command=JointState(name=["arm/a", "arm/b"], position=[0.1, 0.1]),
+                bounded_increment=np.array([0.1, 0.1]),
+            ),
+            _StreamingStepResult(
+                command=JointState(name=["arm/a", "arm/b"], position=[-0.2, -0.2]),
+                bounded_increment=np.array([0.1, 0.1]),
+            ),
         ],
     )
     targets = {"tool": PoseStamped()}
@@ -178,6 +192,32 @@ def test_pose_target_solver_reset_reseeds_from_feedback(mocker: MockerFixture) -
     )
 
     assert step.call_args_list[1].kwargs["command_state"].position == [-0.3, -0.3]
+    assert step.call_args_list[1].kwargs["command_increment_history"] == ()
+
+
+def test_pose_target_solver_reset_during_step_discards_command_and_filter_history(
+    mocker: MockerFixture,
+) -> None:
+    solver = _stateful_solver(mocker)
+
+    def reset_during_step(**_kwargs: object) -> _StreamingStepResult:
+        solver.reset()
+        return _StreamingStepResult(
+            command=JointState(name=["arm/a", "arm/b"], position=[0.1, 0.1]),
+            bounded_increment=np.array([0.1, 0.1]),
+        )
+
+    mocker.patch.object(solver, "_step_frame_targets", side_effect=reset_during_step)
+
+    result = solver.step(
+        {"tool": PoseStamped()},
+        JointState(name=["arm/a", "arm/b"], position=[0.0, 0.0]),
+        0.01,
+    )
+
+    assert result is None
+    assert solver._command_state is None
+    assert tuple(solver._command_increment_history) == ()
 
 
 @pytest.mark.parametrize(

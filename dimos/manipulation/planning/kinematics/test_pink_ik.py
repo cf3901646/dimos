@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+from collections import deque
 from collections.abc import Mapping
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -70,6 +71,10 @@ class _StreamingTestPinkIK(PinkPoseTargetSolver):
         self._robot_contexts = {}
         self.feedback_limit_tolerance = 1e-3
         self.command_limit_margin = 1e-4
+        self._joint_increment_filter_weights = self._validated_increment_filter_weights()
+        self._command_increment_history = deque(
+            maxlen=len(self._joint_increment_filter_weights) - 1
+        )
 
     def step_frame_targets(
         self,
@@ -84,7 +89,7 @@ class _StreamingTestPinkIK(PinkPoseTargetSolver):
         joint_velocity_limits_rad_s: Mapping[str, float] | None = None,
         joint_command_filter_cutoff_hz: float | None = None,
     ) -> JointState:
-        return self._step_frame_targets(
+        result = self._step_frame_targets(
             robot_model=robot_model,
             frame_targets=frame_targets,
             controlled_joints=controlled_joints,
@@ -97,7 +102,10 @@ class _StreamingTestPinkIK(PinkPoseTargetSolver):
             max_joint_velocity_rad_s=max_joint_velocity_rad_s,
             joint_velocity_limits_rad_s=joint_velocity_limits_rad_s or {},
             joint_command_filter_cutoff_hz=joint_command_filter_cutoff_hz,
+            command_increment_history=tuple(self._command_increment_history),
         )
+        self._command_increment_history.append(result.bounded_increment)
+        return result.command
 
     def validate_frame_targets(
         self,
@@ -604,52 +612,135 @@ def test_streaming_envelope_caps_command_at_measured_tracking_distance(
     assert result == pytest.approx([0.15, 0.15, 0.15])
 
 
-def test_step_frame_targets_low_pass_filters_alternating_candidates(
+def test_step_frame_targets_weighted_history_attenuates_alternating_increments(
     mocker: MockerFixture,
 ) -> None:
     _install_fake_modules(mocker)
     ik = _StreamingTestPinkIK(PinkIKConfig())
     context = _combined_control_context(("tool",), ["joint_a"])
     context.robot.model.velocityLimit[:] = 100.0
+    context.robot.model.lowerPositionLimit[:] = -100.0
+    context.robot.model.upperPositionLimit[:] = 100.0
     mocker.patch.object(ik, "_get_control_context", return_value=context)
-    candidates = iter((1.0, -1.0))
+    increments = iter((1.0, -1.0, 1.0, -1.0))
 
-    def set_candidate(**kwargs: Any) -> None:
+    def apply_increment(**kwargs: Any) -> None:
         configuration = kwargs["configuration"]
         q = configuration.q.copy()
-        q[context.robot.mapping.idx_q[0]] = next(candidates)
+        q[context.robot.mapping.idx_q[0]] += next(increments)
         configuration.update(q)
 
-    mocker.patch.object(ik, "_step_configuration", side_effect=set_candidate)
+    mocker.patch.object(ik, "_step_configuration", side_effect=apply_increment)
     initial = JointState(name=["joint_a"], position=[0.0])
     alpha = 1.0 - np.exp(-2.0 * np.pi * 5.0 * 0.01)
+    commands = [initial]
 
+    for _ in range(4):
+        commands.append(
+            ik.step_frame_targets(
+                robot_model=_robot_config(),
+                frame_targets={"tool": PoseStamped()},
+                controlled_joints=["joint_a"],
+                command_state=commands[-1],
+                measured_state=initial,
+                max_command_tracking_error_rad=1.0,
+                dt=0.01,
+                max_joint_velocity_rad_s=100.0,
+                joint_command_filter_cutoff_hz=5.0,
+            )
+        )
+
+    accepted_increments = np.diff([command.position[0] for command in commands])
+    assert accepted_increments == pytest.approx([alpha, -alpha / 3.0, 0.4 * alpha, -0.4 * alpha])
+
+
+def test_step_frame_targets_weighted_history_preserves_steady_increment(
+    mocker: MockerFixture,
+) -> None:
+    _install_fake_modules(mocker)
+    ik = _StreamingTestPinkIK(PinkIKConfig())
+    context = _combined_control_context(("tool",), ["joint_a"])
+    context.robot.model.velocityLimit[:] = 100.0
+    context.robot.model.lowerPositionLimit[:] = -100.0
+    context.robot.model.upperPositionLimit[:] = 100.0
+    mocker.patch.object(ik, "_get_control_context", return_value=context)
+
+    def apply_increment(**kwargs: Any) -> None:
+        configuration = kwargs["configuration"]
+        q = configuration.q.copy()
+        q[context.robot.mapping.idx_q[0]] += 1.0
+        configuration.update(q)
+
+    mocker.patch.object(ik, "_step_configuration", side_effect=apply_increment)
+    initial = JointState(name=["joint_a"], position=[0.0])
+    alpha = 1.0 - np.exp(-2.0 * np.pi * 5.0 * 0.01)
+    commands = [initial]
+
+    for _ in range(4):
+        commands.append(
+            ik.step_frame_targets(
+                robot_model=_robot_config(),
+                frame_targets={"tool": PoseStamped()},
+                controlled_joints=["joint_a"],
+                command_state=commands[-1],
+                measured_state=initial,
+                max_command_tracking_error_rad=2.0,
+                dt=0.01,
+                max_joint_velocity_rad_s=100.0,
+                joint_command_filter_cutoff_hz=5.0,
+            )
+        )
+
+    assert np.diff([command.position[0] for command in commands]) == pytest.approx(
+        np.full(4, alpha)
+    )
+
+
+def test_step_frame_targets_rechecks_tracking_envelope_after_history_filter(
+    mocker: MockerFixture,
+) -> None:
+    _install_fake_modules(mocker)
+    ik = _StreamingTestPinkIK(PinkIKConfig())
+    context = _combined_control_context(("tool",), ["joint_a"])
+    context.robot.model.velocityLimit[:] = 100.0
+    context.robot.model.lowerPositionLimit[:] = -100.0
+    context.robot.model.upperPositionLimit[:] = 100.0
+    mocker.patch.object(ik, "_get_control_context", return_value=context)
+
+    def apply_increment(**kwargs: Any) -> None:
+        configuration = kwargs["configuration"]
+        q = configuration.q.copy()
+        q[context.robot.mapping.idx_q[0]] += 1.0
+        configuration.update(q)
+
+    mocker.patch.object(ik, "_step_configuration", side_effect=apply_increment)
+    initial = JointState(name=["joint_a"], position=[0.0])
     first = ik.step_frame_targets(
         robot_model=_robot_config(),
         frame_targets={"tool": PoseStamped()},
         controlled_joints=["joint_a"],
         command_state=initial,
         measured_state=initial,
-        max_command_tracking_error_rad=1.0,
-        dt=0.01,
-        max_joint_velocity_rad_s=100.0,
-        joint_command_filter_cutoff_hz=5.0,
-    )
-    second = ik.step_frame_targets(
-        robot_model=_robot_config(),
-        frame_targets={"tool": PoseStamped()},
-        controlled_joints=["joint_a"],
-        command_state=first,
-        measured_state=initial,
-        max_command_tracking_error_rad=1.0,
+        max_command_tracking_error_rad=0.2,
         dt=0.01,
         max_joint_velocity_rad_s=100.0,
         joint_command_filter_cutoff_hz=5.0,
     )
 
-    assert first.position == pytest.approx([alpha])
-    assert second.position == pytest.approx([alpha + alpha * (-1.0 - alpha)])
-    assert abs(second.position[0] - first.position[0]) < 1.0
+    second = ik.step_frame_targets(
+        robot_model=_robot_config(),
+        frame_targets={"tool": PoseStamped()},
+        controlled_joints=["joint_a"],
+        command_state=first,
+        measured_state=JointState(name=["joint_a"], position=[-0.1]),
+        max_command_tracking_error_rad=0.15,
+        dt=0.01,
+        max_joint_velocity_rad_s=100.0,
+        joint_command_filter_cutoff_hz=5.0,
+    )
+
+    assert first.position == pytest.approx([0.2])
+    assert second.position == pytest.approx([0.05])
 
 
 def test_step_frame_targets_preserves_controlled_joint_order(

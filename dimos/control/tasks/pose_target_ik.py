@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 from abc import abstractmethod
+from collections import deque
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 import math
@@ -249,8 +250,16 @@ class _PinkControlContext:
     tasks: Mapping[str, pink.Task] | None = None
 
 
+@dataclass(frozen=True)
+class _StreamingStepResult:
+    command: JointState
+    bounded_increment: NDArray[np.float64]
+
+
 class PinkPoseTargetSolver(_PinkSolverCore):
     """Stateful Pink solver owned by one pose-target control task."""
+
+    joint_increment_filter_weights: tuple[float, ...] = (0.1, 0.3, 0.6)
 
     def __init__(self, config: PoseTargetIKTaskConfig) -> None:
         super().__init__(config.pink)
@@ -260,6 +269,10 @@ class PinkPoseTargetSolver(_PinkSolverCore):
         ] = {}
         self._command_state_lock = threading.Lock()
         self._command_state: JointState | None = None
+        self._joint_increment_filter_weights = self._validated_increment_filter_weights()
+        self._command_increment_history: deque[NDArray[np.float64]] = deque(
+            maxlen=max(0, len(self._joint_increment_filter_weights) - 1)
+        )
         self._command_state_generation = 0
         self._validate_frame_targets(
             config.robot_model,
@@ -277,6 +290,9 @@ class PinkPoseTargetSolver(_PinkSolverCore):
         """Advance the persistent command trajectory by one bounded QP step."""
         with self._command_state_lock:
             command_state = JointState(self._command_state or measured_state)
+            command_increment_history = tuple(
+                increment.copy() for increment in self._command_increment_history
+            )
             generation = self._command_state_generation
         result = self._step_frame_targets(
             robot_model=self._control_config.robot_model,
@@ -293,12 +309,14 @@ class PinkPoseTargetSolver(_PinkSolverCore):
             max_joint_velocity_rad_s=self._control_config.max_joint_velocity_rad_s,
             joint_velocity_limits_rad_s=self._control_config.joint_velocity_limits_rad_s,
             joint_command_filter_cutoff_hz=self._control_config.joint_command_filter_cutoff_hz,
+            command_increment_history=command_increment_history,
         )
         with self._command_state_lock:
             if self._command_state_generation != generation:
                 return None
-            self._command_state = JointState(result)
-        return result
+            self._command_state = JointState(result.command)
+            self._command_increment_history.append(result.bounded_increment.copy())
+        return result.command
 
     def frame_poses(
         self,
@@ -317,6 +335,7 @@ class PinkPoseTargetSolver(_PinkSolverCore):
         """Discard the persistent command trajectory."""
         with self._command_state_lock:
             self._command_state = None
+            self._command_increment_history.clear()
             self._command_state_generation += 1
 
     def _step_frame_targets(
@@ -333,7 +352,8 @@ class PinkPoseTargetSolver(_PinkSolverCore):
         max_joint_velocity_rad_s: float = 5.0,
         joint_velocity_limits_rad_s: Mapping[str, float] | None = None,
         joint_command_filter_cutoff_hz: float | None = None,
-    ) -> JointState:
+        command_increment_history: Sequence[NDArray[np.float64]] = (),
+    ) -> _StreamingStepResult:
         """Perform one feedback-bounded Pink update for the control loop."""
         if not frame_targets:
             raise ValueError("Pink frame-target step requires at least one target")
@@ -393,7 +413,7 @@ class PinkPoseTargetSolver(_PinkSolverCore):
             candidate_positions = previous_positions + alpha * (
                 candidate_positions - previous_positions
             )
-        command_positions = self._apply_streaming_command_envelope(
+        instantaneous_positions = self._apply_streaming_command_envelope(
             context=robot_context,
             candidate=candidate_positions,
             previous=previous_positions,
@@ -404,7 +424,55 @@ class PinkPoseTargetSolver(_PinkSolverCore):
             max_tracking_error=max_command_tracking_error_rad,
             command_limit_margin=command_limit_margin,
         )
-        return JointState(name=list(joint_names), position=command_positions.tolist())
+        bounded_increment = instantaneous_positions - previous_positions
+        filtered_increment = self._weighted_joint_increment(
+            bounded_increment,
+            command_increment_history,
+        )
+        command_positions = self._apply_streaming_command_envelope(
+            context=robot_context,
+            candidate=previous_positions + filtered_increment,
+            previous=previous_positions,
+            measured=measured_positions,
+            dt=step_dt,
+            max_joint_velocity=max_joint_velocity_rad_s,
+            joint_velocity_limits=joint_velocity_limits,
+            max_tracking_error=max_command_tracking_error_rad,
+            command_limit_margin=command_limit_margin,
+        )
+        return _StreamingStepResult(
+            command=JointState(name=list(joint_names), position=command_positions.tolist()),
+            bounded_increment=bounded_increment,
+        )
+
+    def _validated_increment_filter_weights(self) -> NDArray[np.float64]:
+        weights = np.asarray(self.joint_increment_filter_weights, dtype=np.float64)
+        if weights.ndim != 1 or len(weights) == 0:
+            raise ValueError("Pink joint increment filter weights must be a non-empty sequence")
+        if not np.all(np.isfinite(weights)) or np.any(weights <= 0.0):
+            raise ValueError("Pink joint increment filter weights must be positive and finite")
+        if np.any(np.diff(weights) <= 0.0):
+            raise ValueError("Pink joint increment filter weights must increase toward newer steps")
+        return weights
+
+    def _weighted_joint_increment(
+        self,
+        bounded_increment: NDArray[np.float64],
+        history: Sequence[NDArray[np.float64]],
+    ) -> NDArray[np.float64]:
+        history_length = len(self._joint_increment_filter_weights) - 1
+        recent_history = tuple(history[-history_length:]) if history_length else ()
+        samples = (*recent_history, bounded_increment)
+        if any(sample.shape != bounded_increment.shape for sample in samples):
+            raise ValueError(
+                "Pink joint increment history does not match the controlled joint count"
+            )
+        weights = self._joint_increment_filter_weights[-len(samples) :]
+        normalized_weights = weights / np.sum(weights)
+        return np.asarray(
+            np.average(np.stack(samples), axis=0, weights=normalized_weights),
+            dtype=np.float64,
+        )
 
     def _validate_frame_targets(
         self,

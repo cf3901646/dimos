@@ -180,16 +180,25 @@ change its cutoff. Lower the cutoff when commands visibly oscillate; raise it
 when smooth motion feels unnecessarily delayed. Gripper commands bypass this
 filter.
 
+The shared streaming solver also averages the three most recent bounded joint
+increments with oldest-to-newest weights `0.1`, `0.3`, and `0.6`. The newest
+solution therefore dominates intentional direction changes, while alternating
+IK solutions are attenuated. Startup weights are normalized over the samples
+available, so the first command has no additional delay. Solver subclasses may
+override `joint_increment_filter_weights` for robot-specific tuning.
+
 The tracking-error limit must tolerate normal execution delay without allowing
 the command trajectory to run far ahead. Keep feedback tolerance small: it
 accounts for encoder noise, not extra workspace.
 
-Each Pink candidate is filtered against the previous accepted command, then
+Each Pink candidate is filtered against the previous accepted command and
 clamped to the per-joint/configured and URDF velocity step, the measured-state
-tracking window, and the inward position margin. The accepted result becomes
-the next filter state. Disengagement, timeout, preemption, and E-STOP clear that
-state, so the next session starts from measured feedback. Invalid feedback or a
-failed Pink solve produces no new command for that tick.
+tracking window, and the inward position margin. Its bounded increment enters
+the weighted history, and the averaged command passes through the same safety
+envelope again. Disengagement, timeout, preemption, and E-STOP clear both
+command and increment history, so the next session starts from measured
+feedback. Invalid feedback or a failed Pink solve produces no new command for
+that tick.
 
 ## Tune in order
 
