@@ -16,6 +16,7 @@
 
 from pathlib import Path
 
+import pytest
 from pytest_mock import MockerFixture
 
 from dimos.control.task import CoordinatorState, JointStateSnapshot
@@ -30,7 +31,7 @@ from dimos.msgs.geometry_msgs.Vector3 import Vector3
 from dimos.msgs.sensor_msgs.JointState import JointState
 
 
-def _config() -> CartesianIKTaskConfig:
+def _config(target_frames: tuple[str, ...] = ("tool",)) -> CartesianIKTaskConfig:
     return CartesianIKTaskConfig(
         joint_names=("arm/joint",),
         robot_model=RobotModelConfig(
@@ -39,8 +40,16 @@ def _config() -> CartesianIKTaskConfig:
             joint_names=["model_joint"],
             joint_name_mapping={"arm/joint": "model_joint"},
         ),
-        target_frames=("tool",),
+        target_frames=target_frames,
     )
+
+
+@pytest.mark.parametrize("target_frames", [(), ("tool", "other")])
+def test_cartesian_config_requires_exactly_one_target_frame(
+    target_frames: tuple[str, ...],
+) -> None:
+    with pytest.raises(ValueError):
+        _config(target_frames)
 
 
 def test_cartesian_leaf_maps_absolute_pose_to_configured_frame(

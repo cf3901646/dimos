@@ -52,25 +52,41 @@ def _solver(mocker: MockerFixture) -> PinkPoseTargetSolver:
     return solver
 
 
+def _config(
+    *,
+    target_frames: tuple[str, ...] = ("tool",),
+    gripper: bool = False,
+) -> EEFTwistTaskConfig:
+    return EEFTwistTaskConfig(
+        joint_names=("arm/joint1", "arm/joint2"),
+        robot_model=_robot_model(),
+        target_frames=target_frames,
+        timeout=0.0,
+        command_timeout=0.3,
+        gripper_joint="arm/gripper" if gripper else None,
+        gripper_open_pos=0.8,
+        gripper_closed_pos=0.1,
+    )
+
+
 def _task(
     mocker: MockerFixture, *, gripper: bool = False
 ) -> tuple[EEFTwistTask, PinkPoseTargetSolver]:
     solver = _solver(mocker)
     task = EEFTwistTask(
         "eef",
-        EEFTwistTaskConfig(
-            joint_names=("arm/joint1", "arm/joint2"),
-            robot_model=_robot_model(),
-            target_frames=("tool",),
-            timeout=0.0,
-            command_timeout=0.3,
-            gripper_joint="arm/gripper" if gripper else None,
-            gripper_open_pos=0.8,
-            gripper_closed_pos=0.1,
-        ),
+        _config(gripper=gripper),
         solver=solver,
     )
     return task, solver
+
+
+@pytest.mark.parametrize("target_frames", [(), ("tool", "other")])
+def test_eef_twist_config_requires_exactly_one_target_frame(
+    target_frames: tuple[str, ...],
+) -> None:
+    with pytest.raises(ValueError):
+        _config(target_frames=target_frames)
 
 
 def _state(t_now: float = 1.0, *, dt: float = 0.01) -> CoordinatorState:

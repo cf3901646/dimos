@@ -39,15 +39,6 @@ if TYPE_CHECKING:
     from dimos.control.hardware_interface import ConnectedHardware, ConnectedWholeBody
 
 
-def _single_target_frame(
-    _instance: object,
-    _attribute: attrs.Attribute[tuple[str, ...]],
-    value: tuple[str, ...],
-) -> None:
-    if len(value) != 1:
-        raise ValueError("CartesianIKTask requires exactly one target frame")
-
-
 @attrs.frozen(slots=False)
 class CartesianIKTaskConfig(PoseTargetIKTaskConfig):
     """Configuration for one absolute Cartesian target frame."""
@@ -55,7 +46,7 @@ class CartesianIKTaskConfig(PoseTargetIKTaskConfig):
     target_frames: tuple[str, ...] = attrs.field(
         default=(),
         converter=string_tuple_converter,
-        validator=_single_target_frame,
+        validator=[attrs.validators.min_len(1), attrs.validators.max_len(1)],
     )
 
 

@@ -46,15 +46,6 @@ if TYPE_CHECKING:
 logger = setup_logger()
 
 
-def _single_target_frame(
-    _instance: object,
-    _attribute: attrs.Attribute[tuple[str, ...]],
-    value: tuple[str, ...],
-) -> None:
-    if len(value) != 1:
-        raise ValueError("EEFTwistTask requires exactly one target frame")
-
-
 @attrs.frozen(slots=False)
 class EEFTwistTaskConfig(PoseTargetIKTaskConfig):
     """Configuration for command-relative end-effector twist control."""
@@ -62,7 +53,7 @@ class EEFTwistTaskConfig(PoseTargetIKTaskConfig):
     target_frames: tuple[str, ...] = attrs.field(
         default=(),
         converter=string_tuple_converter,
-        validator=_single_target_frame,
+        validator=[attrs.validators.min_len(1), attrs.validators.max_len(1)],
     )
     command_timeout: float = attrs.field(default=0.3, converter=float)
     gripper_joint: str | None = None
