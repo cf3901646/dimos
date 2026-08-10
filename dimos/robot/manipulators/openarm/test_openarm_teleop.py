@@ -152,8 +152,17 @@ def test_openarm_quest_blueprint_has_one_bimanual_mock_task() -> None:
     assert task.params["pink"].posture_cost == 0.01
     assert task.params["pink"].lm_damping == 0.01
     assert task.params["max_command_tracking_error_deg"] == 10.0
-    assert task.params["max_joint_velocity_rad_s"] == pytest.approx(np.deg2rad(120.0))
-    assert "joint_velocity_limits_rad_s" not in task.params
+    assert task.params["max_joint_velocity_rad_s"] == 2.0
+    expected_velocity_limits = {
+        joint_name: limit
+        for side_offset in (0, 7)
+        for joint_name, limit in zip(
+            OPENARM_ARM_JOINTS[side_offset : side_offset + 7],
+            (1.0, 1.0, 1.0, 1.0, 2.0, 2.0, 2.0),
+            strict=True,
+        )
+    }
+    assert task.params["joint_velocity_limits_rad_s"] == expected_velocity_limits
     assert task.params["joint_command_filter_cutoff_hz"] == 5.0
     assert task.priority == 10
     assert trajectory.joint_names == OPENARM_ARM_JOINTS
@@ -199,8 +208,16 @@ def test_openarm_quest_commands_both_arms_and_grippers_through_coordinator(
         coordinator.start()
         task = cast("TeleopIKTask", coordinator._tasks[OPENARM_QUEST_TASK_NAME])
         assert task._teleop_config.robot_model.name == "openarm"
-        assert task._teleop_config.max_joint_velocity_rad_s == pytest.approx(np.deg2rad(120.0))
-        assert task._teleop_config.joint_velocity_limits_rad_s == {}
+        assert task._teleop_config.max_joint_velocity_rad_s == 2.0
+        assert task._teleop_config.joint_velocity_limits_rad_s == {
+            joint_name: limit
+            for side_offset in (0, 7)
+            for joint_name, limit in zip(
+                OPENARM_ARM_JOINTS[side_offset : side_offset + 7],
+                (1.0, 1.0, 1.0, 1.0, 2.0, 2.0, 2.0),
+                strict=True,
+            )
+        }
         assert task._teleop_config.joint_command_filter_cutoff_hz == 5.0
         buttons = Buttons()
         buttons.left_primary = True
