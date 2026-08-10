@@ -17,7 +17,6 @@
 from typing import Any, cast
 
 import numpy as np
-import pink
 import pytest
 from pytest_mock import MockerFixture
 
@@ -148,17 +147,13 @@ def test_openarm_quest_blueprint_has_one_bimanual_mock_task() -> None:
     assert "robot_model" not in task.params
     assert task.params["solver_type"] is OpenArmPinkPoseTargetSolver
     assert task.params["pink"].joint_limit_posture_margin == 0.3
+    assert task.params["pink"].position_cost == 8.0
+    assert task.params["pink"].orientation_cost == 2.0
+    assert task.params["pink"].posture_cost == 0.01
+    assert task.params["pink"].lm_damping == 0.01
     assert task.params["max_command_tracking_error_deg"] == 10.0
-    expected_velocity_limits = {
-        joint_name: limit
-        for side_offset in (0, 7)
-        for joint_name, limit in zip(
-            OPENARM_ARM_JOINTS[side_offset : side_offset + 7],
-            (1.0, 1.0, 1.0, 1.0, 2.0, 2.0, 2.0),
-            strict=True,
-        )
-    }
-    assert task.params["joint_velocity_limits_rad_s"] == expected_velocity_limits
+    assert task.params["max_joint_velocity_rad_s"] == pytest.approx(np.deg2rad(120.0))
+    assert "joint_velocity_limits_rad_s" not in task.params
     assert task.params["joint_command_filter_cutoff_hz"] == 5.0
     assert task.priority == 10
     assert trajectory.joint_names == OPENARM_ARM_JOINTS
@@ -204,16 +199,8 @@ def test_openarm_quest_commands_both_arms_and_grippers_through_coordinator(
         coordinator.start()
         task = cast("TeleopIKTask", coordinator._tasks[OPENARM_QUEST_TASK_NAME])
         assert task._teleop_config.robot_model.name == "openarm"
-        assert task._teleop_config.max_joint_velocity_rad_s == 2.0
-        assert task._teleop_config.joint_velocity_limits_rad_s == {
-            joint_name: limit
-            for side_offset in (0, 7)
-            for joint_name, limit in zip(
-                OPENARM_ARM_JOINTS[side_offset : side_offset + 7],
-                (1.0, 1.0, 1.0, 1.0, 2.0, 2.0, 2.0),
-                strict=True,
-            )
-        }
+        assert task._teleop_config.max_joint_velocity_rad_s == pytest.approx(np.deg2rad(120.0))
+        assert task._teleop_config.joint_velocity_limits_rad_s == {}
         assert task._teleop_config.joint_command_filter_cutoff_hz == 5.0
         buttons = Buttons()
         buttons.left_primary = True
@@ -259,8 +246,9 @@ def test_openarm_teleop_pink_objective_uses_robot_specific_tuning() -> None:
     frames = ("openarm_left_grasp_frame", "openarm_right_grasp_frame")
     config = PinkKinematicsConfig(
         dt=0.01,
-        posture_cost=1e-3,
+        posture_cost=0.01,
         joint_limit_posture_margin=0.3,
+        lm_damping=0.01,
         gain=0.25,
     )
     seed = JointState(name=OPENARM_ARM_JOINTS, position=[0.0] * len(OPENARM_ARM_JOINTS))
@@ -273,15 +261,25 @@ def test_openarm_teleop_pink_objective_uses_robot_specific_tuning() -> None:
     assert tasks is not None
     for frame_name in frames:
         frame_task = tasks[f"frame/{frame_name}"]
-        assert frame_task.position_cost == pytest.approx([1.0, 1.0, 1.0])
-        assert frame_task.orientation_cost == pytest.approx([0.2, 0.2, 0.2])
-        manipulability = tasks[f"manipulability/{frame_name}"]
-        assert isinstance(manipulability, pink.tasks.ManipulabilityTask)
-        assert manipulability.cost == 0.005
-        assert manipulability.manipulability_rate == 0.05
-        assert manipulability.mask == pytest.approx([1.0, 1.0, 1.0, 0.0, 0.0, 0.0])
+        assert frame_task.position_cost == pytest.approx([8.0, 8.0, 8.0])
+        assert frame_task.orientation_cost == pytest.approx([2.0, 2.0, 2.0])
+        assert f"manipulability/{frame_name}" not in tasks
     assert tasks["posture/current"].cost == pytest.approx(
-        np.tile([4.0, 3.0, 0.1, 3.0, 1.0, 1.0, 0.1], 2) * 1e-3
+        np.tile([4.0, 3.0, 0.1, 3.0, 1.0, 1.0, 0.1], 2) * 0.01
+    )
+    assert tasks["posture/current"].target_q == pytest.approx(
+        np.tile([0.0, 0.0, 0.0, 0.3, 0.0, 0.0, 0.0], 2)
+    )
+
+    moved_seed = JointState(
+        name=OPENARM_ARM_JOINTS,
+        position=np.tile([0.1, -0.1, 0.2, 0.4, 0.1, -0.1, 0.2], 2).tolist(),
+    )
+    solver.reset()
+    solver.step(targets, moved_seed, 0.01)
+
+    assert tasks["posture/current"].target_q == pytest.approx(
+        np.tile([0.0, 0.0, 0.0, 0.3, 0.0, 0.0, 0.0], 2)
     )
 
 

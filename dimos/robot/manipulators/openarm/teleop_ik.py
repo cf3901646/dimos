@@ -16,17 +16,25 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 import numpy as np
 import pink
 
 from dimos.control.tasks.pose_target_ik import PinkPoseTargetSolver
 
-_FRAME_POSITION_COST = 1.0
-_FRAME_ORIENTATION_COST = 0.2
-_MANIPULABILITY_COST = 0.005
-_MANIPULABILITY_RATE = 0.05
+_FRAME_POSITION_COST = 8.0
+_FRAME_ORIENTATION_COST = 2.0
 _POSTURE_WEIGHTS = np.tile(
+    # Match the proven G1 bimanual tuning: stabilize shoulders and elbows
+    # while leaving the redundant elbow-roll and wrist-yaw joints nearly free.
     np.array([4.0, 3.0, 0.1, 3.0, 1.0, 1.0, 0.1], dtype=np.float64),
+    2,
+)
+_NOMINAL_POSTURE = np.tile(
+    # Canonical zero with joint 4 moved off its lower limit. Unlike the common
+    # current-posture target, this remains stable across streaming ticks.
+    np.array([0.0, 0.0, 0.0, 0.3, 0.0, 0.0, 0.0], dtype=np.float64),
     2,
 )
 
@@ -51,12 +59,19 @@ class OpenArmPinkPoseTargetSolver(PinkPoseTargetSolver):
             raise ValueError("OpenArmPinkPoseTargetSolver requires a positive posture cost")
         posture_task.cost = self.config.posture_cost * _POSTURE_WEIGHTS
 
-        for frame_name in target_frames:
-            tasks[f"manipulability/{frame_name}"] = pink.tasks.ManipulabilityTask(
-                frame_name,
-                configuration.model,
-                cost=_MANIPULABILITY_COST,
-                manipulability_rate=_MANIPULABILITY_RATE,
-                mask="position",
-            )
         return tasks
+
+    def _update_current_posture_target(
+        self,
+        tasks: Mapping[str, pink.Task],
+        configuration: pink.Configuration,
+    ) -> None:
+        posture_task = tasks.get("posture/current")
+        if not isinstance(posture_task, pink.tasks.PostureTask):
+            raise ValueError("OpenArmPinkPoseTargetSolver requires a posture task")
+        if configuration.model.nq != len(_NOMINAL_POSTURE):
+            raise ValueError(
+                f"OpenArm nominal posture has {len(_NOMINAL_POSTURE)} joints, "
+                f"model has {configuration.model.nq}"
+            )
+        posture_task.set_target(_NOMINAL_POSTURE)

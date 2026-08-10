@@ -224,10 +224,15 @@ failed Pink solve produces no new command for that tick.
 
 OpenArm starts in the canonical all-zero pose, where both joint-4 coordinates
 are at their lower limits and the Cartesian Jacobian is rank-deficient. Its
-solver uses a joint-limit posture margin to point only near-limit posture
-coordinates inward while keeping the measured configuration as the streaming
-seed. This creates a deterministic escape direction without a random restart
-or a multi-iteration loop in the control tick.
+solver keeps the measured configuration as the streaming seed but uses a fixed
+inward-neutral posture target with both joint-4 coordinates at `0.3 rad`. Its
+Pink objective follows the proven G1 bimanual tuning: `8:2` position-to-
+orientation costs, a `0.01` posture cost, and per-arm posture weights
+`[4, 3, 0.1, 3, 1, 1, 0.1]`. This keeps shoulders and elbows near a useful
+posture while leaving the redundant elbow-roll and wrist-yaw coordinates freer
+to refine the final pose. The `0.3 rad` OpenArm joint-4 target is the only
+model-specific departure from G1's zero posture and supplies a deterministic
+escape direction without a random restart or multi-iteration control tick.
 
 Treat this as a model-specific response to a verified startup singularity, not
 as a default reason to alter a robot's home pose. Validate the complete IK path
