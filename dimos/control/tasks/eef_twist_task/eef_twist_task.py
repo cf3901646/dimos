@@ -16,14 +16,13 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping
 import threading
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 import attrs
 import numpy as np
 import pinocchio
-from pydantic import Field
 
 from dimos.control.task import CoordinatorState
 from dimos.control.tasks.pose_target_ik import (
@@ -31,15 +30,16 @@ from dimos.control.tasks.pose_target_ik import (
     PinkPoseTargetSolver,
     PoseTargetIKTask,
     PoseTargetIKTaskConfig,
+    PoseTargetIKTaskParams,
+    string_tuple_converter,
 )
-from dimos.manipulation.planning.kinematics.config import PinkKinematicsConfig
-from dimos.manipulation.planning.spec.config import RobotModelConfig
 from dimos.msgs.geometry_msgs.PoseStamped import PoseStamped
-from dimos.protocol.service.spec import BaseConfig
 from dimos.utils.logging_config import setup_logger
 from dimos.utils.transform_utils import matrix_to_pose, pose_to_matrix, twist_to_numpy
 
 if TYPE_CHECKING:
+    from dimos.control.coordinator import TaskConfig
+    from dimos.control.hardware_interface import ConnectedHardware, ConnectedWholeBody
     from dimos.msgs.geometry_msgs.TwistStamped import TwistStamped
     from dimos.msgs.std_msgs.Bool import Bool
 
@@ -55,17 +55,13 @@ def _single_target_frame(
         raise ValueError("EEFTwistTask requires exactly one target frame")
 
 
-def _to_target_frames(value: Sequence[str]) -> tuple[str, ...]:
-    return tuple(value)
-
-
 @attrs.frozen(slots=False)
 class EEFTwistTaskConfig(PoseTargetIKTaskConfig):
     """Configuration for command-relative end-effector twist control."""
 
     target_frames: tuple[str, ...] = attrs.field(
         default=(),
-        converter=_to_target_frames,
+        converter=string_tuple_converter,
         validator=_single_target_frame,
     )
     command_timeout: float = attrs.field(default=0.3, converter=float)
@@ -202,23 +198,19 @@ class EEFTwistTask(PoseTargetIKTask):
             self._target_pose = None
 
 
-class EEFTwistTaskParams(BaseConfig):
-    robot_model: RobotModelConfig
+class EEFTwistTaskParams(PoseTargetIKTaskParams):
     target_frame: str | None = None
-    pink: PinkKinematicsConfig = Field(default_factory=PinkKinematicsConfig)
     timeout: float = 0.3
-    max_joint_velocity_rad_s: float = 5.0
-    joint_velocity_limits_rad_s: dict[str, float] = Field(default_factory=dict)
-    joint_command_filter_cutoff_hz: float | None = 5.0
-    max_command_tracking_error_deg: float = 10.0
-    feedback_limit_tolerance: float = 1e-3
-    command_limit_margin: float = 1e-4
     gripper_joint: str | None = None
     gripper_open_pos: float = 0.0
     gripper_closed_pos: float = 0.0
 
 
-def create_task(cfg: Any, hardware: Any) -> EEFTwistTask:
+def create_task(
+    cfg: TaskConfig,
+    hardware: Mapping[str, ConnectedHardware | ConnectedWholeBody],
+) -> EEFTwistTask:
+    del hardware
     params = EEFTwistTaskParams.model_validate(cfg.params)
     return EEFTwistTask(
         cfg.name,

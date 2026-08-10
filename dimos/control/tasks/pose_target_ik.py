@@ -17,14 +17,18 @@
 from __future__ import annotations
 
 from abc import abstractmethod
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 import math
+from pathlib import Path
 import threading
+from types import MappingProxyType
 from typing import TYPE_CHECKING
 
 import attrs
 import numpy as np
+import pink
+from pydantic import Field
 
 from dimos.control.task import (
     BaseControlTask,
@@ -35,23 +39,54 @@ from dimos.control.task import (
 )
 from dimos.manipulation.planning.kinematics.config import PinkKinematicsConfig
 from dimos.manipulation.planning.kinematics.pink_solver import (
-    PinkJointLimitError,
+    _get_frame_id,
+    _PinkRobotContext,
     _PinkSolverCore,
+    _seed_positions_for_mapping,
 )
 from dimos.manipulation.planning.spec.config import RobotModelConfig
+from dimos.msgs.geometry_msgs.PoseStamped import PoseStamped
 from dimos.msgs.sensor_msgs.JointState import JointState
+from dimos.protocol.service.spec import BaseConfig
 from dimos.utils.logging_config import setup_logger
+from dimos.utils.transform_utils import matrix_to_pose, pose_to_matrix
 
 if TYPE_CHECKING:
-    from dimos.msgs.geometry_msgs.PoseStamped import PoseStamped
+    from numpy.typing import NDArray
 
 logger = setup_logger()
 
 _FEEDBACK_LIMIT_WARNING_INTERVAL_S = 1.0
 
 
-def _to_tuple(value: Sequence[str]) -> tuple[str, ...]:
-    return tuple(value)
+def string_tuple_converter(values: Iterable[str]) -> tuple[str, ...]:
+    """Give attrs a typed constructor for immutable sequence fields."""
+    return tuple(values)
+
+
+class PinkJointLimitError(ValueError):
+    """Raised when measured feedback exceeds its model limit tolerance."""
+
+    def __init__(
+        self,
+        *,
+        joint_name: str,
+        value: float,
+        lower: float,
+        upper: float,
+        tolerance: float,
+    ) -> None:
+        self.joint_name = joint_name
+        self.value = value
+        self.lower = lower
+        self.upper = upper
+        self.tolerance = tolerance
+        self.boundary = "lower" if value < lower else "upper"
+        limit = lower if self.boundary == "lower" else upper
+        super().__init__(
+            f"Measured joint '{joint_name}' value {value} exceeds {self.boundary} limit "
+            f"{limit} beyond feedback tolerance {tolerance}"
+        )
 
 
 def _validate_unique_names(
@@ -88,10 +123,6 @@ def _optional_positive_finite(
 ) -> None:
     if value is not None and (not math.isfinite(value) or value <= 0.0):
         raise ValueError("PoseTargetIKTask requires a positive finite joint command filter cutoff")
-
-
-def _to_optional_float(value: float | None) -> float | None:
-    return None if value is None else float(value)
 
 
 def _to_joint_velocity_limits(value: Mapping[str, float]) -> dict[str, float]:
@@ -137,14 +168,14 @@ class PoseTargetIKTaskConfig:
     """Configuration shared by absolute and Quest pose-target tasks."""
 
     joint_names: tuple[str, ...] = attrs.field(
-        converter=_to_tuple,
+        converter=string_tuple_converter,
         validator=_validate_unique_names,
     )
     robot_model: RobotModelConfig = attrs.field(
         validator=attrs.validators.instance_of(RobotModelConfig)
     )
     target_frames: tuple[str, ...] = attrs.field(
-        converter=_to_tuple,
+        converter=string_tuple_converter,
         validator=_validate_unique_names,
     )
     pink: PinkKinematicsConfig = attrs.field(factory=PinkKinematicsConfig)
@@ -162,7 +193,7 @@ class PoseTargetIKTaskConfig:
     )
     joint_command_filter_cutoff_hz: float | None = attrs.field(
         default=5.0,
-        converter=_to_optional_float,
+        converter=attrs.converters.optional(float),
         validator=_optional_positive_finite,
     )
     max_command_tracking_error_deg: float = attrs.field(
@@ -182,6 +213,26 @@ class PoseTargetIKTaskConfig:
     )
 
 
+class PoseTargetIKTaskParams(BaseConfig):
+    """Serialized configuration shared by streaming pose-target tasks.
+
+    The velocity fields bound each generated command step. The command filter
+    suppresses high-frequency QP motion, while the tracking-error and limit
+    margins keep the generated trajectory close to measured hardware state and
+    inside the robot model's position limits.
+    """
+
+    robot_model: RobotModelConfig
+    pink: PinkKinematicsConfig = Field(default_factory=PinkKinematicsConfig)
+    timeout: float = 0.5
+    max_joint_velocity_rad_s: float = 5.0
+    joint_velocity_limits_rad_s: dict[str, float] = Field(default_factory=dict)
+    joint_command_filter_cutoff_hz: float | None = 5.0
+    max_command_tracking_error_deg: float = 10.0
+    feedback_limit_tolerance: float = 1e-3
+    command_limit_margin: float = 1e-4
+
+
 @dataclass(frozen=True)
 class FrameTargetSnapshot:
     """One atomic control-tick snapshot produced by a task leaf."""
@@ -191,12 +242,22 @@ class FrameTargetSnapshot:
     extra_joint_positions: Mapping[str, float] = field(default_factory=dict)
 
 
+@dataclass
+class _PinkControlContext:
+    robot: _PinkRobotContext
+    frames: Mapping[str, _PinkRobotContext]
+    tasks: Mapping[str, pink.Task] | None = None
+
+
 class PinkPoseTargetSolver(_PinkSolverCore):
     """Stateful Pink solver owned by one pose-target control task."""
 
     def __init__(self, config: PoseTargetIKTaskConfig) -> None:
         super().__init__(config.pink)
         self._control_config = config
+        self._control_contexts: dict[
+            tuple[str, tuple[str, ...], tuple[str, ...]], _PinkControlContext
+        ] = {}
         self._command_state_lock = threading.Lock()
         self._command_state: JointState | None = None
         self._command_state_generation = 0
@@ -215,7 +276,7 @@ class PinkPoseTargetSolver(_PinkSolverCore):
     ) -> JointState | None:
         """Advance the persistent command trajectory by one bounded QP step."""
         with self._command_state_lock:
-            command_state = _copy_joint_state(self._command_state or measured_state)
+            command_state = JointState(self._command_state or measured_state)
             generation = self._command_state_generation
         result = self._step_frame_targets(
             robot_model=self._control_config.robot_model,
@@ -236,7 +297,7 @@ class PinkPoseTargetSolver(_PinkSolverCore):
         with self._command_state_lock:
             if self._command_state_generation != generation:
                 return None
-            self._command_state = _copy_joint_state(result)
+            self._command_state = JointState(result)
         return result
 
     def frame_poses(
@@ -257,6 +318,261 @@ class PinkPoseTargetSolver(_PinkSolverCore):
         with self._command_state_lock:
             self._command_state = None
             self._command_state_generation += 1
+
+    def _step_frame_targets(
+        self,
+        robot_model: RobotModelConfig,
+        frame_targets: Mapping[str, PoseStamped],
+        controlled_joints: Sequence[str],
+        command_state: JointState,
+        measured_state: JointState,
+        max_command_tracking_error_rad: float,
+        feedback_limit_tolerance: float,
+        command_limit_margin: float,
+        dt: float | None = None,
+        max_joint_velocity_rad_s: float = 5.0,
+        joint_velocity_limits_rad_s: Mapping[str, float] | None = None,
+        joint_command_filter_cutoff_hz: float | None = None,
+    ) -> JointState:
+        """Perform one feedback-bounded Pink update for the control loop."""
+        if not frame_targets:
+            raise ValueError("Pink frame-target step requires at least one target")
+        joint_names = tuple(controlled_joints)
+        if not joint_names:
+            raise ValueError("Pink frame-target step requires at least one controlled joint")
+        if len(set(joint_names)) != len(joint_names):
+            raise ValueError("Pink controlled joint names must be unique")
+
+        frame_names = tuple(frame_targets)
+        control_context = self._get_control_context(robot_model, frame_names, joint_names)
+        robot_context = control_context.robot
+        targets = {
+            frame_name: self._target_in_model_frame(robot_model, frame_targets[frame_name])
+            for frame_name in frame_names
+        }
+        if not np.isfinite(max_command_tracking_error_rad) or max_command_tracking_error_rad <= 0.0:
+            raise ValueError("Pink command tracking error must be positive and finite")
+        step_dt = self.config.dt if dt is None else dt
+        if not np.isfinite(step_dt) or step_dt <= 0.0:
+            raise ValueError("Pink streaming timestep must be positive and finite")
+        if not np.isfinite(max_joint_velocity_rad_s) or max_joint_velocity_rad_s <= 0.0:
+            raise ValueError("Pink streaming joint velocity limit must be positive and finite")
+        if joint_command_filter_cutoff_hz is not None and (
+            not np.isfinite(joint_command_filter_cutoff_hz) or joint_command_filter_cutoff_hz <= 0.0
+        ):
+            raise ValueError("Pink streaming command filter cutoff must be positive and finite")
+        joint_velocity_limits = joint_velocity_limits_rad_s or {}
+
+        previous_positions = _seed_positions_for_mapping(command_state, robot_context.mapping)
+        measured_positions = _seed_positions_for_mapping(measured_state, robot_context.mapping)
+        raw_command_q = self._q_from_dimos_positions(robot_context, previous_positions)
+        measured_q = self._q_from_dimos_positions(robot_context, measured_positions)
+        self._validate_streaming_feedback(robot_context, measured_q, feedback_limit_tolerance)
+        command_q = self._clamp_streaming_configuration(
+            robot_context, raw_command_q, command_limit_margin
+        )
+        configuration = pink.Configuration(
+            robot_context.model,
+            robot_context.data,
+            command_q.copy(),
+        )
+        if control_context.tasks is None:
+            control_context.tasks = self._build_task_stack(configuration, frame_names)
+        tasks = control_context.tasks
+        self._update_frame_task_targets(tasks, targets)
+        self._update_current_posture_target(tasks, configuration)
+        self._step_configuration(
+            robot_context=robot_context,
+            configuration=configuration,
+            tasks=tasks,
+            dt=step_dt,
+        )
+        candidate_positions = self._q_to_dimos_positions(robot_context, configuration.q)
+        if joint_command_filter_cutoff_hz is not None:
+            alpha = -np.expm1(-2.0 * np.pi * joint_command_filter_cutoff_hz * step_dt)
+            candidate_positions = previous_positions + alpha * (
+                candidate_positions - previous_positions
+            )
+        command_positions = self._apply_streaming_command_envelope(
+            context=robot_context,
+            candidate=candidate_positions,
+            previous=previous_positions,
+            measured=measured_positions,
+            dt=step_dt,
+            max_joint_velocity=max_joint_velocity_rad_s,
+            joint_velocity_limits=joint_velocity_limits,
+            max_tracking_error=max_command_tracking_error_rad,
+            command_limit_margin=command_limit_margin,
+        )
+        return JointState(name=list(joint_names), position=command_positions.tolist())
+
+    def _validate_frame_targets(
+        self,
+        robot_model: RobotModelConfig,
+        frame_names: Sequence[str],
+        controlled_joints: Sequence[str],
+        command_limit_margin: float,
+    ) -> None:
+        """Build and validate the model, controlled joints, and target frames."""
+        frames = tuple(frame_names)
+        joints = tuple(controlled_joints)
+        if not frames or len(set(frames)) != len(frames):
+            raise ValueError("Pink target frame names must be non-empty and unique")
+        if not joints or len(set(joints)) != len(joints):
+            raise ValueError("Pink controlled joint names must be non-empty and unique")
+        context = self._get_control_context(robot_model, frames, joints)
+        self._validate_streaming_limit_margin(context.robot, command_limit_margin)
+
+    def _frame_poses(
+        self,
+        robot_model: RobotModelConfig,
+        frame_names: Sequence[str],
+        controlled_joints: Sequence[str],
+        seed: JointState,
+    ) -> dict[str, PoseStamped]:
+        """Return current world poses for named frames at a joint seed."""
+        if not frame_names:
+            raise ValueError("Pink frame pose query requires at least one frame")
+        context = self._get_control_context(
+            robot_model,
+            tuple(frame_names),
+            tuple(controlled_joints),
+        )
+        positions = _seed_positions_for_mapping(seed, context.robot.mapping)
+        q = self._q_from_dimos_positions(context.robot, positions)
+        base_world = pose_to_matrix(robot_model.base_pose)
+        poses: dict[str, PoseStamped] = {}
+        for frame_name, frame_context in context.frames.items():
+            pose = matrix_to_pose(base_world @ self._current_frame_matrix(frame_context, q))
+            poses[frame_name] = PoseStamped(
+                frame_id=robot_model.base_link,
+                position=pose.position,
+                orientation=pose.orientation,
+            )
+        return poses
+
+    def _get_control_context(
+        self,
+        config: RobotModelConfig,
+        frame_names: Sequence[str],
+        controlled_joints: Sequence[str],
+    ) -> _PinkControlContext:
+        frames = tuple(frame_names)
+        if not frames:
+            raise ValueError("Pink control context requires at least one frame")
+        cache_key = (
+            str(Path(config.model_path).resolve()),
+            frames,
+            tuple(controlled_joints),
+        )
+        if cache_key not in self._control_contexts:
+            robot_context = self._build_robot_context(config, frames[0], controlled_joints)
+            contexts = {frames[0]: robot_context}
+            for frame_name in frames[1:]:
+                contexts[frame_name] = _PinkRobotContext(
+                    model=robot_context.model,
+                    data=robot_context.data,
+                    frame_id=_get_frame_id(robot_context.model, frame_name),
+                    frame_name=frame_name,
+                    mapping=robot_context.mapping,
+                )
+            self._control_contexts[cache_key] = _PinkControlContext(
+                robot=robot_context,
+                frames=MappingProxyType(contexts),
+            )
+        return self._control_contexts[cache_key]
+
+    def _validate_streaming_feedback(
+        self,
+        context: _PinkRobotContext,
+        measured_q: NDArray[np.float64],
+        tolerance: float,
+    ) -> None:
+        for joint_name, q_index, lower, upper in _bounded_controlled_joint_limits(context):
+            value = float(measured_q[q_index])
+            if value < lower - tolerance or value > upper + tolerance:
+                raise PinkJointLimitError(
+                    joint_name=joint_name,
+                    value=value,
+                    lower=lower,
+                    upper=upper,
+                    tolerance=tolerance,
+                )
+
+    def _clamp_streaming_configuration(
+        self,
+        context: _PinkRobotContext,
+        q: NDArray[np.float64],
+        margin: float,
+    ) -> NDArray[np.float64]:
+        normalized = q.copy()
+        for _joint_name, q_index, lower, upper in _bounded_controlled_joint_limits(context):
+            normalized[q_index] = np.clip(float(q[q_index]), lower + margin, upper - margin)
+        return normalized
+
+    def _apply_streaming_command_envelope(
+        self,
+        *,
+        context: _PinkRobotContext,
+        candidate: NDArray[np.float64],
+        previous: NDArray[np.float64],
+        measured: NDArray[np.float64],
+        dt: float,
+        max_joint_velocity: float,
+        joint_velocity_limits: Mapping[str, float],
+        max_tracking_error: float,
+        command_limit_margin: float,
+    ) -> NDArray[np.float64]:
+        """Clamp one Pink candidate to the complete streaming safety envelope."""
+        joint_count = len(context.mapping.idx_q)
+        expected_shape = (joint_count,)
+        if any(values.shape != expected_shape for values in (candidate, previous, measured)):
+            raise ValueError("Pink streaming states do not match the controlled joint count")
+
+        model_velocity = np.asarray(context.model.velocityLimit, dtype=np.float64)
+        if model_velocity.shape != (context.model.nv,):
+            raise ValueError("Pink model velocity limits do not match its tangent dimension")
+        velocity_limits = np.full(joint_count, max_joint_velocity, dtype=np.float64)
+        for index, joint_name in enumerate(context.mapping.dimos_joint_names):
+            override = joint_velocity_limits.get(joint_name)
+            if override is not None:
+                velocity_limits[index] = override
+        for index, v_index in enumerate(context.mapping.idx_v):
+            urdf_velocity = float(model_velocity[v_index])
+            if np.isfinite(urdf_velocity) and 1e-10 < urdf_velocity < 1e20:
+                velocity_limits[index] = min(velocity_limits[index], urdf_velocity)
+
+        step_limits = velocity_limits * dt
+        lower = np.maximum(previous - step_limits, measured - max_tracking_error)
+        upper = np.minimum(previous + step_limits, measured + max_tracking_error)
+        controlled_index_by_q = {
+            q_index: controlled_index
+            for controlled_index, q_index in enumerate(context.mapping.idx_q)
+        }
+        for _joint_name, q_index, urdf_lower, urdf_upper in _bounded_controlled_joint_limits(
+            context
+        ):
+            index = controlled_index_by_q[q_index]
+            lower[index] = max(lower[index], urdf_lower + command_limit_margin)
+            upper[index] = min(upper[index], urdf_upper - command_limit_margin)
+
+        invalid = np.flatnonzero(lower > upper)
+        if invalid.size:
+            joint_name = context.mapping.dimos_joint_names[int(invalid[0])]
+            raise ValueError(f"Pink streaming command envelope is empty for '{joint_name}'")
+        return np.clip(candidate, lower, upper)
+
+    def _validate_streaming_limit_margin(
+        self,
+        context: _PinkRobotContext,
+        margin: float,
+    ) -> None:
+        for joint_name, _q_index, lower, upper in _bounded_controlled_joint_limits(context):
+            if lower + margin > upper - margin:
+                raise ValueError(
+                    f"Pink command limit margin {margin} leaves no valid range for "
+                    f"controlled joint '{joint_name}' with limits [{lower}, {upper}]"
+                )
 
 
 class PoseTargetIKTask(BaseControlTask):
@@ -406,5 +722,28 @@ class PoseTargetIKTask(BaseControlTask):
         """Allow a leaf to reset semantics after preemption."""
 
 
-def _copy_joint_state(state: JointState) -> JointState:
-    return JointState(name=list(state.name), position=list(state.position))
+def _bounded_controlled_joint_limits(
+    context: _PinkRobotContext,
+) -> list[tuple[str, int, float, float]]:
+    lower_limits = np.asarray(context.model.lowerPositionLimit, dtype=np.float64)
+    upper_limits = np.asarray(context.model.upperPositionLimit, dtype=np.float64)
+    if lower_limits.shape != (context.model.nq,) or upper_limits.shape != (context.model.nq,):
+        raise ValueError("Pink model position limits do not match its configuration dimension")
+
+    bounded: list[tuple[str, int, float, float]] = []
+    for joint_name, q_index in zip(
+        context.mapping.dimos_joint_names,
+        context.mapping.idx_q,
+        strict=True,
+    ):
+        lower = float(lower_limits[q_index])
+        upper = float(upper_limits[q_index])
+        if (
+            np.isfinite(lower)
+            and np.isfinite(upper)
+            and lower > -1e20
+            and upper < 1e20
+            and upper > lower + 1e-10
+        ):
+            bounded.append((joint_name, q_index, lower, upper))
+    return bounded

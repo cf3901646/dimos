@@ -27,9 +27,16 @@ import numpy as np
 import pytest
 from pytest_mock import MockerFixture
 
+import dimos.control.tasks.pose_target_ik as pose_target_ik
+from dimos.control.tasks.pose_target_ik import (
+    PinkJointLimitError,
+    PinkPoseTargetSolver,
+    _PinkControlContext,
+)
 from dimos.manipulation.planning.factory import create_kinematics
 from dimos.manipulation.planning.groups.models import PlanningGroup, PlanningGroupDefinition
 from dimos.manipulation.planning.kinematics.config import PinkKinematicsConfig
+import dimos.manipulation.planning.kinematics.pink_ik as pink_planning
 from dimos.manipulation.planning.kinematics.pink_ik import (
     PinkIK,
     PinkIKConfig,
@@ -37,11 +44,10 @@ from dimos.manipulation.planning.kinematics.pink_ik import (
 import dimos.manipulation.planning.kinematics.pink_solver as pink_ik
 from dimos.manipulation.planning.kinematics.pink_solver import (
     _CURRENT_POSTURE_TASK,
-    PinkJointLimitError,
     _build_joint_mapping,
     _frame_task_key,
-    _PinkControlContext,
     _PinkRobotContext,
+    _PinkSolverCore,
     _seed_positions_for_mapping,
 )
 from dimos.manipulation.planning.spec.config import RobotModelConfig
@@ -55,11 +61,13 @@ from dimos.msgs.sensor_msgs.JointState import JointState
 _TRACKING_ERROR_RAD = np.deg2rad(10.0)
 
 
-class _StreamingTestPinkIK(PinkIK):
-    """Expose private streaming primitives for shared-core unit tests only."""
+class _StreamingTestPinkIK(PinkPoseTargetSolver):
+    """Expose private control-side streaming primitives for unit tests."""
 
     def __init__(self, config: PinkIKConfig) -> None:
-        super().__init__(config)
+        _PinkSolverCore.__init__(self, config)
+        self._control_contexts = {}
+        self._robot_contexts = {}
         self.feedback_limit_tolerance = 1e-3
         self.command_limit_margin = 1e-4
 
@@ -222,7 +230,20 @@ class _DerivedComposablePinkIK(_ComposablePinkIK):
         return tasks
 
 
-class _RecordingPinkIK(_StreamingTestPinkIK):
+class _RecordingStreamingPinkIK(_StreamingTestPinkIK):
+    def __init__(self, config: PinkIKConfig) -> None:
+        super().__init__(config)
+        self.before_tasks: list[Mapping[str, Any]] = []
+        self.after_velocities: list[np.ndarray] = []
+
+    def _before_solve(self, tasks: Mapping[str, Any], configuration: Any, dt: float) -> None:
+        self.before_tasks.append(tasks)
+
+    def _after_solve(self, tasks: Mapping[str, Any], velocity: np.ndarray, dt: float) -> None:
+        self.after_velocities.append(velocity.copy())
+
+
+class _RecordingPinkIK(PinkIK):
     def __init__(self, config: PinkIKConfig) -> None:
         super().__init__(config)
         self.before_tasks: list[Mapping[str, Any]] = []
@@ -292,6 +313,9 @@ def _fake_modules(converge: bool = True) -> _FakeModules:
 
 def _install_fake_modules(mocker: MockerFixture, converge: bool = True) -> _FakeModules:
     modules = _fake_modules(converge=converge)
+    mocker.patch.object(pose_target_ik, "pink", modules.pink)
+    mocker.patch.object(pink_planning, "pink", modules.pink)
+    mocker.patch.object(pink_planning, "pinocchio", modules.pinocchio)
     mocker.patch.object(pink_ik, "pink", modules.pink)
     mocker.patch.object(pink_ik, "pinocchio", modules.pinocchio)
     mocker.patch.object(pink_ik.qpsolvers, "available_solvers", ["proxqp"])
@@ -316,9 +340,14 @@ def _robot_config() -> RobotModelConfig:
     )
 
 
-def _pink_ik(mocker: MockerFixture, converge: bool = True) -> _StreamingTestPinkIK:
+def _streaming_ik(mocker: MockerFixture, converge: bool = True) -> _StreamingTestPinkIK:
     _install_fake_modules(mocker, converge=converge)
     return _StreamingTestPinkIK(PinkIKConfig(max_iterations=3))
+
+
+def _pink_ik(mocker: MockerFixture, converge: bool = True) -> PinkIK:
+    _install_fake_modules(mocker, converge=converge)
+    return PinkIK(PinkIKConfig(max_iterations=3))
 
 
 def _context() -> _PinkRobotContext:
@@ -536,7 +565,7 @@ def test_joint_order_mapping_uses_names_not_positions() -> None:
 def test_streaming_envelope_intersects_configured_and_urdf_velocity(
     mocker: MockerFixture,
 ) -> None:
-    ik = _pink_ik(mocker)
+    ik = _streaming_ik(mocker)
     context = _context()
 
     result = ik._apply_streaming_command_envelope(
@@ -557,7 +586,7 @@ def test_streaming_envelope_intersects_configured_and_urdf_velocity(
 def test_streaming_envelope_caps_command_at_measured_tracking_distance(
     mocker: MockerFixture,
 ) -> None:
-    ik = _pink_ik(mocker)
+    ik = _streaming_ik(mocker)
     context = _context()
 
     result = ik._apply_streaming_command_envelope(
@@ -626,7 +655,7 @@ def test_step_frame_targets_low_pass_filters_alternating_candidates(
 def test_step_frame_targets_preserves_controlled_joint_order(
     mocker: MockerFixture,
 ) -> None:
-    ik = _pink_ik(mocker)
+    ik = _streaming_ik(mocker)
     mocker.patch.object(
         ik,
         "_get_control_context",
@@ -789,7 +818,7 @@ def test_task_hooks_receive_read_only_stack_and_successful_velocity(
     mocker: MockerFixture,
 ) -> None:
     _install_fake_modules(mocker)
-    ik = _RecordingPinkIK(PinkIKConfig(posture_cost=0.0))
+    ik = _RecordingStreamingPinkIK(PinkIKConfig(posture_cost=0.0))
     context = _combined_control_context(("tool",), ["joint_a", "joint_b", "joint_c"])
     mocker.patch.object(ik, "_get_control_context", return_value=context)
 
@@ -818,7 +847,7 @@ def test_after_solve_hook_is_not_called_when_solver_raises(
     mocker: MockerFixture,
 ) -> None:
     _install_fake_modules(mocker)
-    ik = _RecordingPinkIK(PinkIKConfig(posture_cost=0.0))
+    ik = _RecordingStreamingPinkIK(PinkIKConfig(posture_cost=0.0))
     context = _combined_control_context(("tool",), ["joint_a", "joint_b", "joint_c"])
     mocker.patch.object(ik, "_get_control_context", return_value=context)
     mocker.patch.object(pink_ik.pink, "solve_ik", side_effect=RuntimeError("no solution"))
@@ -899,7 +928,7 @@ def test_step_frame_targets_normalizes_feedback_and_saturates_commands(
 def test_step_frame_targets_rejects_feedback_beyond_tolerance(
     mocker: MockerFixture,
 ) -> None:
-    ik = _pink_ik(mocker)
+    ik = _streaming_ik(mocker)
     mocker.patch.object(
         ik,
         "_get_control_context",
@@ -923,7 +952,7 @@ def test_step_frame_targets_rejects_feedback_beyond_tolerance(
 def test_step_frame_targets_velocity_limits_unbounded_position_joint(
     mocker: MockerFixture,
 ) -> None:
-    ik = _pink_ik(mocker)
+    ik = _streaming_ik(mocker)
     context = _combined_control_context(("tool",), ["joint_b"])
     context.robot.model.lowerPositionLimit[0] = -np.inf
     context.robot.model.upperPositionLimit[0] = np.inf
@@ -967,7 +996,7 @@ def test_validate_frame_targets_rejects_margin_wider_than_joint_range(
 def test_step_frame_targets_rejects_unknown_frame(mocker: MockerFixture, tmp_path: Path) -> None:
     modules = _install_fake_modules(mocker)
     modules.pinocchio.buildModelFromUrdf = lambda path: _FakeModel()  # type: ignore[attr-defined]
-    mocker.patch.object(pink_ik, "prepare_urdf_for_drake", return_value=tmp_path / "prepared.urdf")
+    mocker.patch.object(pink_ik, "prepare_urdf", return_value=tmp_path / "prepared.urdf")
     config = _robot_config()
     config.model_path = tmp_path / "fake.urdf"
     config.model_path.write_text("<robot/>")
@@ -991,14 +1020,13 @@ def test_mapping_failure_for_missing_joint() -> None:
         _build_joint_mapping(_FakeModel(), config)
 
 
-def test_solve_single_returns_successful_ik_result(mocker: MockerFixture) -> None:
+def test_solve_targets_returns_successful_ik_result(mocker: MockerFixture) -> None:
     ik = _pink_ik(mocker, converge=True)
     target = np.eye(4)
     target[:3, 3] = [0.1, 0.2, 0.3]
 
-    result = ik._solve_single(
-        robot_context=_context(),
-        target_model=target,
+    result = ik._solve_targets(
+        targets=[(_context(), target)],
         seed_q=np.zeros(3),
         lower_limits=np.array([-1.0, -1.0, -1.0]),
         upper_limits=np.array([1.0, 1.0, 1.0]),
@@ -1020,9 +1048,8 @@ def test_planning_uses_named_stack_and_task_lifecycle_hooks(
     target = np.eye(4)
     target[:3, 3] = [0.1, 0.2, 0.3]
 
-    result = ik._solve_single(
-        robot_context=_context(),
-        target_model=target,
+    result = ik._solve_targets(
+        targets=[(_context(), target)],
         seed_q=np.zeros(3),
         lower_limits=np.array([-1.0, -1.0, -1.0]),
         upper_limits=np.array([1.0, 1.0, 1.0]),
@@ -1036,14 +1063,13 @@ def test_planning_uses_named_stack_and_task_lifecycle_hooks(
     assert ik.after_velocities[0] == pytest.approx([2.0, 4.0, 6.0])
 
 
-def test_solve_single_reports_non_convergence(mocker: MockerFixture) -> None:
+def test_solve_targets_reports_non_convergence(mocker: MockerFixture) -> None:
     ik = _pink_ik(mocker, converge=False)
     target = np.eye(4)
     target[:3, 3] = [0.1, 0.0, 0.0]
 
-    result = ik._solve_single(
-        robot_context=_context(),
-        target_model=target,
+    result = ik._solve_targets(
+        targets=[(_context(), target)],
         seed_q=np.zeros(3),
         lower_limits=np.array([-1.0, -1.0, -1.0]),
         upper_limits=np.array([1.0, 1.0, 1.0]),
@@ -1081,7 +1107,7 @@ def test_solve_retries_after_joint_limit_failure(mocker: MockerFixture) -> None:
     ik._robot_contexts = {("robot", "tool"): context}
     calls = 0
 
-    def fake_solve_single(**_: object) -> IKResult:
+    def fake_solve_targets(**_: object) -> IKResult:
         nonlocal calls
         calls += 1
         if calls == 1:
@@ -1101,7 +1127,7 @@ def test_solve_retries_after_joint_limit_failure(mocker: MockerFixture) -> None:
             iterations=1,
         )
 
-    solve_single = mocker.patch.object(ik, "_solve_single", side_effect=fake_solve_single)
+    solve_targets = mocker.patch.object(ik, "_solve_targets", side_effect=fake_solve_targets)
 
     result = ik.solve(
         world=cast("Any", _FakeWorld(collision_free=True)),
@@ -1114,14 +1140,14 @@ def test_solve_retries_after_joint_limit_failure(mocker: MockerFixture) -> None:
         max_attempts=2,
     )
 
-    assert solve_single.call_count == 2
+    assert solve_targets.call_count == 2
     assert result.status == IKStatus.SUCCESS
 
 
 def test_robot_context_cache_key_includes_tip_frame(mocker: MockerFixture, tmp_path: Path) -> None:
     modules = _install_fake_modules(mocker)
     modules.pinocchio.buildModelFromUrdf = lambda path: _FakeModel()  # type: ignore[attr-defined]
-    mocker.patch.object(pink_ik, "prepare_urdf_for_drake", return_value=tmp_path / "prepared.urdf")
+    mocker.patch.object(pink_ik, "prepare_urdf", return_value=tmp_path / "prepared.urdf")
     model_path = tmp_path / "fake.urdf"
     model_path.write_text("<robot/>")
     world = _FakeWorld()
@@ -1142,7 +1168,7 @@ def test_build_robot_context_rejects_base_link_not_model_root(
     model.frames[0] = _FakeFrame("base", parent_joint=1)
     modules = _install_fake_modules(mocker)
     modules.pinocchio.buildModelFromUrdf = lambda path: model  # type: ignore[attr-defined]
-    mocker.patch.object(pink_ik, "prepare_urdf_for_drake", return_value=tmp_path / "prepared.urdf")
+    mocker.patch.object(pink_ik, "prepare_urdf", return_value=tmp_path / "prepared.urdf")
     model_path = tmp_path / "fake.urdf"
     model_path.write_text("<robot/>")
     config = _robot_config()
@@ -1160,7 +1186,7 @@ def test_solve_pose_targets_uses_group_tip_and_filters_group_joints(
     get_context = mocker.patch.object(ik, "_get_robot_context", return_value=context)
     mocker.patch.object(
         ik,
-        "_solve_single",
+        "_solve_targets",
         return_value=IKResult(
             status=IKStatus.SUCCESS,
             joint_state=JointState(
@@ -1213,7 +1239,7 @@ def test_solve_pose_targets_partial_seed_reads_world_state(mocker: MockerFixture
     mocker.patch.object(ik, "_get_robot_context", return_value=_context())
     mocker.patch.object(
         ik,
-        "_solve_single",
+        "_solve_targets",
         return_value=IKResult(
             status=IKStatus.SUCCESS,
             joint_state=JointState(
@@ -1242,9 +1268,9 @@ def test_solve_pose_targets_multi_target_uses_multi_frame_solve(mocker: MockerFi
     ik = _pink_ik(mocker)
     world = _FakeWorld()
     mocker.patch.object(ik, "_get_robot_context", return_value=_context())
-    solve_multi = mocker.patch.object(
+    solve_targets = mocker.patch.object(
         ik,
-        "_solve_multi",
+        "_solve_targets",
         return_value=IKResult(
             status=IKStatus.SUCCESS,
             joint_state=JointState(
@@ -1271,8 +1297,8 @@ def test_solve_pose_targets_multi_target_uses_multi_frame_solve(mocker: MockerFi
         max_attempts=1,
     )
 
-    solve_multi.assert_called_once()
-    assert len(solve_multi.call_args.kwargs["targets"]) == 2
+    solve_targets.assert_called_once()
+    assert len(solve_targets.call_args.kwargs["targets"]) == 2
     assert result.joint_state is not None
     assert result.joint_state.name == ["arm/joint_a", "arm/joint_b", "arm/joint_c"]
     assert result.joint_state.position == [0.1, 0.2, 0.3]
@@ -1284,9 +1310,9 @@ def test_solve_pose_targets_checks_multi_robot_solution_together(
     ik = _pink_ik(mocker)
     world = _MultiRobotCollisionWorld()
     mocker.patch.object(ik, "_get_robot_context", return_value=_context())
-    solve_single = mocker.patch.object(
+    solve_targets = mocker.patch.object(
         ik,
-        "_solve_single",
+        "_solve_targets",
         side_effect=[
             IKResult(
                 status=IKStatus.SUCCESS,
@@ -1329,7 +1355,7 @@ def test_solve_pose_targets_checks_multi_robot_solution_together(
         max_attempts=1,
     )
 
-    assert solve_single.call_count == 2
+    assert solve_targets.call_count == 2
     assert result.status == IKStatus.COLLISION
     assert world.config_collision_checks == 0
     assert world.context_collision_checks == 1

@@ -16,12 +16,13 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-from dataclasses import dataclass, field
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
+from enum import Enum
 import threading
-from typing import Any, Literal
+from typing import TYPE_CHECKING
 
-from pydantic import Field
+import attrs
 
 from dimos.control.task import CoordinatorState
 from dimos.control.tasks.pose_target_ik import (
@@ -29,6 +30,8 @@ from dimos.control.tasks.pose_target_ik import (
     PinkPoseTargetSolver,
     PoseTargetIKTask,
     PoseTargetIKTaskConfig,
+    PoseTargetIKTaskParams,
+    string_tuple_converter,
 )
 from dimos.manipulation.planning.kinematics.config import PinkKinematicsConfig
 from dimos.manipulation.planning.spec.config import RobotModelConfig
@@ -37,36 +40,66 @@ from dimos.msgs.geometry_msgs.PoseStamped import PoseStamped
 from dimos.protocol.service.spec import BaseConfig
 from dimos.teleop.quest.quest_types import Buttons
 
-OperatorHand = Literal["left", "right"]
+if TYPE_CHECKING:
+    from dimos.control.coordinator import TaskConfig
+    from dimos.control.hardware_interface import ConnectedHardware, ConnectedWholeBody
 
 
-@dataclass(frozen=True)
+class OperatorHand(str, Enum):
+    """Operator input channels supported by pose-target teleoperation."""
+
+    LEFT = "left"
+    RIGHT = "right"
+
+
+def _binding_tuple_converter(
+    values: Iterable[TeleopHandBinding],
+) -> tuple[TeleopHandBinding, ...]:
+    return tuple(values)
+
+
+@attrs.frozen(slots=False)
 class TeleopHandBinding:
     """Bind one operator hand to one robot frame and optional gripper."""
 
-    hand: OperatorHand
+    hand: OperatorHand = attrs.field(converter=OperatorHand)
     target_frame: str
     gripper_joint: str | None = None
     gripper_open_position: float = 0.0
     gripper_closed_position: float = 0.0
 
 
-@dataclass(frozen=True)
+@attrs.frozen(slots=False)
 class TeleopIKTaskConfig:
     """Configuration for single-arm or bimanual pose control."""
 
-    joint_names: tuple[str, ...]
+    joint_names: tuple[str, ...] = attrs.field(converter=string_tuple_converter)
     robot_model: RobotModelConfig
-    bindings: tuple[TeleopHandBinding, ...]
-    pink: PinkKinematicsConfig = field(default_factory=PinkKinematicsConfig)
+    bindings: tuple[TeleopHandBinding, ...] = attrs.field(converter=_binding_tuple_converter)
+    pink: PinkKinematicsConfig = attrs.field(factory=PinkKinematicsConfig)
     priority: int = 10
     timeout: float = 0.5
     max_joint_velocity_rad_s: float = 5.0
-    joint_velocity_limits_rad_s: dict[str, float] = field(default_factory=dict)
+    joint_velocity_limits_rad_s: dict[str, float] = attrs.field(factory=dict)
     joint_command_filter_cutoff_hz: float | None = 5.0
     max_command_tracking_error_deg: float = 10.0
     feedback_limit_tolerance: float = 1e-3
     command_limit_margin: float = 1e-4
+
+    def __attrs_post_init__(self) -> None:
+        if not 1 <= len(self.bindings) <= 2:
+            raise ValueError("TeleopIKTask requires exactly one or two hand bindings")
+        hands = [binding.hand for binding in self.bindings]
+        frames = [binding.target_frame for binding in self.bindings]
+        grippers = [
+            binding.gripper_joint for binding in self.bindings if binding.gripper_joint is not None
+        ]
+        if len(set(hands)) != len(hands):
+            raise ValueError("TeleopIKTask requires unique operator hands")
+        if any(not frame for frame in frames) or len(set(frames)) != len(frames):
+            raise ValueError("TeleopIKTask requires unique target frames")
+        if len(set(grippers)) != len(grippers):
+            raise ValueError("TeleopIKTask requires unique gripper joints")
 
 
 @dataclass
@@ -76,6 +109,12 @@ class _HandState:
     controller_reference: PoseStamped | None = None
     robot_reference: PoseStamped | None = None
     gripper_target: float = 0.0
+
+
+class _SessionState(Enum):
+    DISENGAGED = "disengaged"
+    ENGAGED = "engaged"
+    ESTOPPED = "estopped"
 
 
 class TeleopIKTask(PoseTargetIKTask):
@@ -89,7 +128,6 @@ class TeleopIKTask(PoseTargetIKTask):
         solver: PinkPoseTargetSolver | None = None,
         solver_type: type[PinkPoseTargetSolver] | None = None,
     ) -> None:
-        self._validate_bindings(name, config)
         self._teleop_config = config
         self._bindings = {binding.hand: binding for binding in config.bindings}
         self._lock = threading.Lock()
@@ -97,10 +135,8 @@ class TeleopIKTask(PoseTargetIKTask):
             binding.hand: _HandState(gripper_target=binding.gripper_open_position)
             for binding in config.bindings
         }
-        self._engagement_condition = False
-        self._engaged = False
-        self._estopped = False
-        self._engagement_generation = 0
+        self._session_state = _SessionState.DISENGAGED
+        self._session_epoch = 0
         gripper_joints = tuple(
             binding.gripper_joint
             for binding in config.bindings
@@ -127,48 +163,27 @@ class TeleopIKTask(PoseTargetIKTask):
             solver_type=solver_type,
         )
 
-    @staticmethod
-    def _validate_bindings(name: str, config: TeleopIKTaskConfig) -> None:
-        if not 1 <= len(config.bindings) <= 2:
-            raise ValueError(f"TeleopIKTask '{name}' requires exactly one or two hand bindings")
-        hands = [binding.hand for binding in config.bindings]
-        frames = [binding.target_frame for binding in config.bindings]
-        grippers = [
-            binding.gripper_joint
-            for binding in config.bindings
-            if binding.gripper_joint is not None
-        ]
-        if any(hand not in ("left", "right") for hand in hands):
-            raise ValueError(f"TeleopIKTask '{name}' has an unknown operator hand")
-        if len(set(hands)) != len(hands):
-            raise ValueError(f"TeleopIKTask '{name}' requires unique operator hands")
-        if any(not frame for frame in frames) or len(set(frames)) != len(frames):
-            raise ValueError(f"TeleopIKTask '{name}' requires unique target frames")
-        if len(set(grippers)) != len(grippers):
-            raise ValueError(f"TeleopIKTask '{name}' requires unique gripper joints")
-
     def is_active(self) -> bool:
         with self._lock:
-            return (
-                not self._estopped
-                and self._engaged
-                and all(state.latest_pose is not None for state in self._hands.values())
+            return self._session_state is _SessionState.ENGAGED and all(
+                state.latest_pose is not None for state in self._hands.values()
             )
 
     def set_estop(self, estopped: bool) -> None:
         """Latch or clear E-STOP; latching clears the complete session."""
         with self._lock:
-            self._estopped = estopped
             if estopped:
-                self._disengage_locked()
+                self._end_session_locked(_SessionState.ESTOPPED)
+            elif self._session_state is _SessionState.ESTOPPED:
+                self._session_state = _SessionState.DISENGAGED
 
     def on_left_cartesian_command(self, pose: Pose | PoseStamped, t_now: float) -> bool:
         """Store the latest absolute left-controller pose."""
-        return self._on_controller_pose("left", pose, t_now)
+        return self._on_controller_pose(OperatorHand.LEFT, pose, t_now)
 
     def on_right_cartesian_command(self, pose: Pose | PoseStamped, t_now: float) -> bool:
         """Store the latest absolute right-controller pose."""
-        return self._on_controller_pose("right", pose, t_now)
+        return self._on_controller_pose(OperatorHand.RIGHT, pose, t_now)
 
     def _on_controller_pose(
         self, hand: OperatorHand, pose: Pose | PoseStamped, t_now: float
@@ -182,7 +197,7 @@ class TeleopIKTask(PoseTargetIKTask):
             orientation=pose.orientation,
         )
         with self._lock:
-            if self._estopped:
+            if self._session_state is _SessionState.ESTOPPED:
                 return False
             state = self._hands[hand]
             state.latest_pose = sample
@@ -193,12 +208,12 @@ class TeleopIKTask(PoseTargetIKTask):
         """Update the all-bound-hands deadman condition and gripper targets."""
         del t_now
         primary_by_hand = {
-            "left": msg.left_primary,
-            "right": msg.right_primary,
+            OperatorHand.LEFT: msg.left_primary,
+            OperatorHand.RIGHT: msg.right_primary,
         }
         trigger_by_hand = {
-            "left": msg.left_trigger_analog,
-            "right": msg.right_trigger_analog,
+            OperatorHand.LEFT: msg.left_trigger_analog,
+            OperatorHand.RIGHT: msg.right_trigger_analog,
         }
         with self._lock:
             for hand, binding in self._bindings.items():
@@ -211,44 +226,39 @@ class TeleopIKTask(PoseTargetIKTask):
                 )
 
             condition = all(primary_by_hand[hand] for hand in self._bindings)
-            if self._estopped:
-                condition = False
-            if condition and not self._engagement_condition:
+            if self._session_state is _SessionState.ESTOPPED:
+                return True
+            if condition and self._session_state is _SessionState.DISENGAGED:
                 self._engage_locked()
-            elif not condition and self._engagement_condition:
-                self._disengage_locked()
-            self._engagement_condition = condition
+            elif not condition and self._session_state is _SessionState.ENGAGED:
+                self._end_session_locked(_SessionState.DISENGAGED)
         return True
 
     def _engage_locked(self) -> None:
-        self._engaged = True
-        self._engagement_generation += 1
-        for state in self._hands.values():
-            state.latest_pose = None
-            state.last_update_time = 0.0
-            state.controller_reference = None
-            state.robot_reference = None
+        self._session_state = _SessionState.ENGAGED
+        self._session_epoch += 1
+        self._clear_hand_session_locked()
 
-    def _disengage_locked(self) -> None:
+    def _end_session_locked(self, state: _SessionState) -> None:
         self._reset_command_state()
-        self._engaged = False
-        self._engagement_condition = False
-        self._engagement_generation += 1
-        for state in self._hands.values():
-            state.latest_pose = None
-            state.last_update_time = 0.0
-            state.controller_reference = None
-            state.robot_reference = None
+        self._session_state = state
+        self._session_epoch += 1
+        self._clear_hand_session_locked()
+
+    def _clear_hand_session_locked(self) -> None:
+        for hand_state in self._hands.values():
+            hand_state.latest_pose = None
+            hand_state.last_update_time = 0.0
+            hand_state.controller_reference = None
+            hand_state.robot_reference = None
 
     def _frame_target_snapshot(self, state: CoordinatorState) -> FrameTargetSnapshot | None:
         with self._lock:
-            if (
-                self._estopped
-                or not self._engaged
-                or any(hand.latest_pose is None for hand in self._hands.values())
+            if self._session_state is not _SessionState.ENGAGED or any(
+                hand.latest_pose is None for hand in self._hands.values()
             ):
                 return None
-            generation = self._engagement_generation
+            session_epoch = self._session_epoch
             needs_capture = any(
                 hand.controller_reference is None or hand.robot_reference is None
                 for hand in self._hands.values()
@@ -261,8 +271,8 @@ class TeleopIKTask(PoseTargetIKTask):
                 return None
             with self._lock:
                 if (
-                    not self._engaged
-                    or generation != self._engagement_generation
+                    self._session_state is not _SessionState.ENGAGED
+                    or session_epoch != self._session_epoch
                     or any(hand.latest_pose is None for hand in self._hands.values())
                 ):
                     return None
@@ -272,7 +282,10 @@ class TeleopIKTask(PoseTargetIKTask):
                     hand_state.robot_reference = robot_poses[binding.target_frame]
 
         with self._lock:
-            if not self._engaged or generation != self._engagement_generation:
+            if (
+                self._session_state is not _SessionState.ENGAGED
+                or session_epoch != self._session_epoch
+            ):
                 return None
             targets: dict[str, PoseStamped] = {}
             extras: dict[str, float] = {}
@@ -301,18 +314,18 @@ class TeleopIKTask(PoseTargetIKTask):
 
     def _on_target_timeout(self) -> None:
         with self._lock:
-            self._disengage_locked()
+            self._end_session_locked(_SessionState.DISENGAGED)
 
     def _on_pose_target_preempted(self, by_task: str, joints: frozenset[str]) -> None:
         with self._lock:
-            self._disengage_locked()
+            self._end_session_locked(_SessionState.DISENGAGED)
 
     def start(self) -> None:
         """Teleop tasks remain inert until their deadman condition is met."""
 
     def stop(self) -> None:
         with self._lock:
-            self._disengage_locked()
+            self._end_session_locked(_SessionState.DISENGAGED)
 
 
 class TeleopHandBindingParams(BaseConfig):
@@ -325,25 +338,16 @@ class TeleopHandBindingParams(BaseConfig):
     gripper_closed_position: float = 0.0
 
 
-class TeleopIKTaskParams(BaseConfig):
+class TeleopIKTaskParams(PoseTargetIKTaskParams):
     """Task-owned parameters carried inside the generic task envelope."""
 
-    robot_model: RobotModelConfig
     bindings: list[TeleopHandBindingParams]
-    pink: PinkKinematicsConfig = Field(default_factory=PinkKinematicsConfig)
     solver_type: type[PinkPoseTargetSolver] = PinkPoseTargetSolver
-    timeout: float = 0.5
-    max_joint_velocity_rad_s: float = 5.0
-    joint_velocity_limits_rad_s: dict[str, float] = Field(default_factory=dict)
-    joint_command_filter_cutoff_hz: float | None = 5.0
-    max_command_tracking_error_deg: float = 10.0
-    feedback_limit_tolerance: float = 1e-3
-    command_limit_margin: float = 1e-4
 
 
 def create_task(
-    cfg: Any,
-    hardware: Mapping[str, Any],
+    cfg: TaskConfig,
+    hardware: Mapping[str, ConnectedHardware | ConnectedWholeBody],
 ) -> TeleopIKTask:
     """Create and validate a pose-target teleop task from registry configuration."""
     params = TeleopIKTaskParams.model_validate(cfg.params)

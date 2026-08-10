@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import Any, TypedDict
+from typing import Any, NotRequired, TypedDict
 
 from dimos.control.components import HardwareComponent
 from dimos.control.coordinator import ControlCoordinator, TaskConfig
@@ -41,6 +41,16 @@ class GripperTaskOverrides(TypedDict, total=False):
     gripper_joint: str
     gripper_open_pos: float
     gripper_closed_pos: float
+
+
+class TeleopBinding(TypedDict):
+    """Declarative mapping from an operator hand to one robot target."""
+
+    hand: str
+    target_frame: str
+    gripper_joint: NotRequired[str]
+    gripper_open_position: NotRequired[float]
+    gripper_closed_position: NotRequired[float]
 
 
 def trajectory_task(
@@ -122,7 +132,7 @@ def teleop_ik_task(
     hardware: HardwareComponent,
     *,
     robot_model: RobotModelConfig,
-    bindings: Sequence[dict[str, Any]],
+    bindings: Sequence[TeleopBinding],
     name: str,
     joint_names: Sequence[str] | None = None,
     priority: int = 10,

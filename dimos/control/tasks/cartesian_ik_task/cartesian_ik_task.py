@@ -16,12 +16,11 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 import threading
 from typing import TYPE_CHECKING
 
 import attrs
-from pydantic import Field
 
 from dimos.control.task import CoordinatorState
 from dimos.control.tasks.pose_target_ik import (
@@ -29,12 +28,11 @@ from dimos.control.tasks.pose_target_ik import (
     PinkPoseTargetSolver,
     PoseTargetIKTask,
     PoseTargetIKTaskConfig,
+    PoseTargetIKTaskParams,
+    string_tuple_converter,
 )
-from dimos.manipulation.planning.kinematics.config import PinkKinematicsConfig
-from dimos.manipulation.planning.spec.config import RobotModelConfig
 from dimos.msgs.geometry_msgs.Pose import Pose
 from dimos.msgs.geometry_msgs.PoseStamped import PoseStamped
-from dimos.protocol.service.spec import BaseConfig
 
 if TYPE_CHECKING:
     from dimos.control.coordinator import TaskConfig
@@ -50,17 +48,13 @@ def _single_target_frame(
         raise ValueError("CartesianIKTask requires exactly one target frame")
 
 
-def _to_target_frames(value: Sequence[str]) -> tuple[str, ...]:
-    return tuple(value)
-
-
 @attrs.frozen(slots=False)
 class CartesianIKTaskConfig(PoseTargetIKTaskConfig):
     """Configuration for one absolute Cartesian target frame."""
 
     target_frames: tuple[str, ...] = attrs.field(
         default=(),
-        converter=_to_target_frames,
+        converter=string_tuple_converter,
         validator=_single_target_frame,
     )
 
@@ -133,19 +127,10 @@ class CartesianIKTask(PoseTargetIKTask):
         self.clear()
 
 
-class CartesianIKTaskParams(BaseConfig):
+class CartesianIKTaskParams(PoseTargetIKTaskParams):
     """Task-owned parameters carried inside the generic task envelope."""
 
-    robot_model: RobotModelConfig
     target_frame: str
-    pink: PinkKinematicsConfig = Field(default_factory=PinkKinematicsConfig)
-    timeout: float = 0.5
-    max_joint_velocity_rad_s: float = 5.0
-    joint_velocity_limits_rad_s: dict[str, float] = Field(default_factory=dict)
-    joint_command_filter_cutoff_hz: float | None = 5.0
-    max_command_tracking_error_deg: float = 10.0
-    feedback_limit_tolerance: float = 1e-3
-    command_limit_margin: float = 1e-4
 
 
 def create_task(

@@ -14,10 +14,11 @@
 
 """Construction assertions for migrated Quest manipulator blueprints."""
 
-from typing import Any
+from typing import cast
 
 from dimos.control.coordinator import ControlCoordinator, TaskConfig
 from dimos.core.coordination.blueprints import Blueprint
+from dimos.robot.manipulators.common.blueprints import TeleopBinding
 from dimos.teleop.quest.blueprints import (
     teleop_quest_dual,
     teleop_quest_hand_xarm7,
@@ -30,17 +31,17 @@ def _coordinator_tasks(blueprint: Blueprint) -> list[TaskConfig]:
     atom = next(
         atom for atom in blueprint.blueprints if issubclass(atom.module, ControlCoordinator)
     )
-    return atom.kwargs["tasks"]
+    return cast("list[TaskConfig]", atom.kwargs["tasks"])
 
 
 def _quest_tasks(blueprint: Blueprint) -> list[TaskConfig]:
     return [task for task in _coordinator_tasks(blueprint) if task.type == "teleop_ik"]
 
 
-def _binding(task: TaskConfig) -> dict[str, Any]:
+def _binding(task: TaskConfig) -> TeleopBinding:
     bindings = task.params["bindings"]
     assert len(bindings) == 1
-    return bindings[0]
+    return cast("TeleopBinding", bindings[0])
 
 
 def test_single_arm_blueprint_uses_one_frame_binding_and_right_stream() -> None:

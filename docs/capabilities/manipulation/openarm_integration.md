@@ -129,11 +129,12 @@ Do not change the canonical startup pose to hide the symptom. Follow
 [Pink IK Configuration and Tuning](/docs/capabilities/manipulation/pink_ik_tuning.md)
 to verify the model, tune objective weights, and bound streaming commands.
 
-The OpenArm Damiao adapter clamps encoder feedback that is no more than
-`0.05 rad` outside a declared joint limit. A larger excursion indicates a
-calibration, model, or encoder fault. The adapter disables the motors, rejects
-further activation, and logs the affected joint and bounds. Inspect the arm,
-then restart the blueprint or reconnect the hardware before resuming motion.
+The shared Damiao hardware gate derives each angular joint limit from the
+robot URDF and clamps encoder feedback that is no more than `0.05 rad` outside
+it. A larger excursion indicates a calibration, model, or encoder fault. The
+adapter disables the motors, rejects further activation, and logs the affected
+joint and bounds. Inspect the arm, then restart the blueprint or reconnect the
+hardware before resuming motion.
 
 ## Further reading
 

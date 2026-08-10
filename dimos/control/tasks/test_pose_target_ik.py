@@ -22,14 +22,12 @@ from pytest_mock import MockerFixture
 from dimos.control.task import CoordinatorState, JointStateSnapshot
 from dimos.control.tasks.pose_target_ik import (
     FrameTargetSnapshot,
+    PinkJointLimitError,
     PinkPoseTargetSolver,
     PoseTargetIKTask,
     PoseTargetIKTaskConfig,
 )
-from dimos.manipulation.planning.kinematics.pink_solver import (
-    PinkJointLimitError,
-    _PinkSolverCore,
-)
+from dimos.manipulation.planning.kinematics.pink_solver import _PinkSolverCore
 from dimos.manipulation.planning.spec.config import RobotModelConfig
 from dimos.msgs.geometry_msgs.PoseStamped import PoseStamped
 from dimos.msgs.sensor_msgs.JointState import JointState

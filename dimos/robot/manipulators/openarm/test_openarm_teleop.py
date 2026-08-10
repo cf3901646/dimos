@@ -14,7 +14,7 @@
 
 """Construction and component tests for safe OpenArm Quest teleoperation."""
 
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 import pink
@@ -22,10 +22,13 @@ import pytest
 from pytest_mock import MockerFixture
 
 from dimos.control.tasks.pose_target_ik import PoseTargetIKTaskConfig
+from dimos.control.tasks.teleop_ik_task.teleop_ik_task import TeleopIKTask
 from dimos.control.tick_loop import TickLoop
 from dimos.core.coordination.blueprint_config.parser import BlueprintConfigParser
 from dimos.core.coordination.blueprints import Blueprint
+from dimos.hardware.whole_body.spec import WholeBodyAdapter
 from dimos.manipulation.planning.kinematics.config import PinkKinematicsConfig
+from dimos.manipulation.planning.spec.config import RobotModelConfig
 from dimos.msgs.geometry_msgs.PoseStamped import PoseStamped
 from dimos.msgs.sensor_msgs.JointState import JointState
 from dimos.robot.manipulators.openarm.blueprints.teleop import (
@@ -53,7 +56,7 @@ def _module_kwargs(blueprint: Blueprint, module_type: type) -> dict[str, Any]:
 
 
 def _solver_config(
-    model: Any,
+    model: RobotModelConfig,
     frames: tuple[str, ...],
     pink_config: PinkKinematicsConfig,
 ) -> PoseTargetIKTaskConfig:
@@ -199,7 +202,7 @@ def test_openarm_quest_commands_both_arms_and_grippers_through_coordinator(
 
     try:
         coordinator.start()
-        task = coordinator._tasks[OPENARM_QUEST_TASK_NAME]
+        task = cast("TeleopIKTask", coordinator._tasks[OPENARM_QUEST_TASK_NAME])
         assert task._teleop_config.robot_model.name == "openarm"
         assert task._teleop_config.max_joint_velocity_rad_s == 2.0
         assert task._teleop_config.joint_velocity_limits_rad_s == {
@@ -230,7 +233,7 @@ def test_openarm_quest_commands_both_arms_and_grippers_through_coordinator(
         coordinator._tick_loop._tick()
 
         connected = coordinator._hardware["openarm"]
-        states = connected.adapter.read_motor_states()
+        states = cast("WholeBodyAdapter", connected.adapter).read_motor_states()
         assert [state.q for state in states[: len(OPENARM_ARM_JOINTS)]] == [0.01] * len(
             OPENARM_ARM_JOINTS
         )
