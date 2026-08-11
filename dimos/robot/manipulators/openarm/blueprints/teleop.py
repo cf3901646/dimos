@@ -59,9 +59,7 @@ _OPENARM_JOINT_VELOCITY_LIMITS_RAD_S = {
 }
 
 _openarm_keyboard_hw = openarm_hardware()
-_openarm_control_models = {
-    side: openarm_control_model_config(side) for side in ("left", "right")
-}
+_openarm_control_models = {side: openarm_control_model_config(side) for side in ("left", "right")}
 
 
 def _eef_twist_task(side: str, *, priority: int = 10) -> TaskConfig:
