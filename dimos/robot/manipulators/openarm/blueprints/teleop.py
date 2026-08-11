@@ -31,12 +31,10 @@ from dimos.robot.manipulators.common.blueprints import (
 from dimos.robot.manipulators.common.topics import DEFAULT_TRAJECTORY_TASK_NAME
 from dimos.robot.manipulators.openarm.config import (
     OPENARM_ARM_JOINTS,
-    OPENARM_DOF,
     OPENARM_GRIPPER_JOINTS,
-    OPENARM_LEFT_MODEL,
-    OPENARM_RIGHT_MODEL,
     openarm_arm_joints,
     openarm_bimanual_model_config,
+    openarm_control_model_config,
     openarm_hardware,
     openarm_mock_hardware,
 )
@@ -61,6 +59,9 @@ _OPENARM_JOINT_VELOCITY_LIMITS_RAD_S = {
 }
 
 _openarm_keyboard_hw = openarm_hardware()
+_openarm_control_models = {
+    side: openarm_control_model_config(side) for side in ("left", "right")
+}
 
 
 def _eef_twist_task(side: str, *, priority: int = 10) -> TaskConfig:
@@ -69,10 +70,7 @@ def _eef_twist_task(side: str, *, priority: int = 10) -> TaskConfig:
         type="eef_twist",
         joint_names=openarm_arm_joints(side),
         priority=priority,
-        params={
-            "model_path": OPENARM_LEFT_MODEL if side == "left" else OPENARM_RIGHT_MODEL,
-            "ee_joint_id": OPENARM_DOF,
-        },
+        params={"robot_model": _openarm_control_models[side]},
     )
 
 

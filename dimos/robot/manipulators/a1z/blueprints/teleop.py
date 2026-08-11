@@ -69,16 +69,19 @@ coordinator_teleop_a1z = autoconnect(
         tasks=[
             teleop_ik_task(
                 _a1z_quest_hw,
-                hand="left",
                 name="teleop_a1z",
                 robot_model=_a1z_quest_model,
-                control_ik={"max_velocity": 2.0},
+                bindings=[
+                    {
+                        "hand": "left",
+                        "target_frame": _a1z_quest_model.end_effector_link,
+                        "gripper_joint": _a1z_quest_hw.gripper_joints[0],
+                        "gripper_open_position": 1.0,
+                        "gripper_closed_position": 0.0,
+                    }
+                ],
                 priority=20,
-                params={
-                    "gripper_joint": _a1z_quest_hw.gripper_joints[0],
-                    "gripper_open_pos": 1.0,
-                    "gripper_closed_pos": 0.0,
-                },
+                params={"max_joint_velocity_rad_s": 2.0},
             ),
             trajectory_task(_a1z_quest_hw),
         ],
