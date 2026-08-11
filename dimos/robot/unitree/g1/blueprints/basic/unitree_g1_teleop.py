@@ -19,17 +19,15 @@ The full ``unitree-g1-groot-wbc`` stack (locomotion policy, nav, viewer,
 retargeting module and the dimos.imitation data-collection stack. Put on the
 headset, open ``https://<host>:8443/teleop``, and:
 
-    left stick        walk forward/back (+ yaw or strafe, see
-                      ``right_stick_mode``)
+    left stick        walk forward/back (+ yaw in strafe mode)
     right stick       yaw (press = zero-Twist e-stop)
-    both triggers     hold to track your hands with the robot's arms
-                      (release: arms hold in place)
+    X + A             hold to track both arms from a shared reference
     B                 start / save an episode
     Y                 discard the in-progress episode
 
-Wrist targets route to the ``dual_arm_ik`` coordinator task declared in
-the groot blueprint (frame_id "dual_arm_ik/left|right"); locomotion goes
-out as ``cmd_vel``.
+Controller poses route to the shared ``teleop_g1`` coordinator task declared
+in the groot blueprint. Locomotion enters ``MovementManager.tele_cmd_vel`` so
+operator input cancels navigation before reaching the GR00T WBC task.
 
 Recording runs continuously into a timestamped session DB under
 ``~/.local/state/dimos/recordings/``; B/Y only place episode markers
@@ -61,26 +59,27 @@ from dimos.imitation.collection.episode_monitor import EpisodeMonitorModule
 from dimos.imitation.collection.recorder import CollectionRecorder
 from dimos.msgs.geometry_msgs.PoseStamped import PoseStamped
 from dimos.msgs.sensor_msgs.Image import Image
-from dimos.robot.unitree.g1.blueprints.basic.unitree_g1_groot_wbc import unitree_g1_groot_wbc
-from dimos.robot.unitree.g1.quest_teleop import G1QuestTeleopModule
+from dimos.robot.unitree.g1.blueprints.basic.unitree_g1_groot_wbc import (
+    G1_TELEOP_TASK_NAME,
+    unitree_g1_groot_wbc,
+)
+from dimos.teleop.quest.quest_extensions import MobileVideoArmTeleopModule
 
 
 class G1CollectionRecorder(CollectionRecorder):
-    """CollectionRecorder + the commanded wrist targets.
+    """CollectionRecorder plus the operator's absolute controller poses.
 
-    The dual-arm IK runs inside the coordinator, so commanded *joint*
-    targets never appear on a stream — but the operator's commanded wrist
-    poses do (frame_id "dual_arm_ik/left|right" on the cartesian command
-    stream). Recording them keeps the commanded-action option open at
-    export time; without them a session can only ever yield next-state
-    actions.
+    The shared teleop IK captures controller and robot references internally,
+    so joint commands do not appear on a stream. Recording both controller
+    streams preserves the operator input alongside measured joint state.
     """
 
     # Own process: sqlite/eMMC writes and the torch import must not share
     # a GIL with control modules.
     dedicated_worker = True
 
-    coordinator_cartesian_command: In[PoseStamped]
+    left_cartesian_command: In[PoseStamped]
+    right_cartesian_command: In[PoseStamped]
 
 
 def _session_db() -> str:
@@ -108,7 +107,9 @@ def _camera_if_real() -> tuple[Blueprint, ...]:
 unitree_g1_teleop = (
     autoconnect(
         unitree_g1_groot_wbc,
-        G1QuestTeleopModule.blueprint(),
+        MobileVideoArmTeleopModule.blueprint(
+            task_names={"left": G1_TELEOP_TASK_NAME, "right": G1_TELEOP_TASK_NAME}
+        ),
         *_camera_if_real(),
         EpisodeMonitorModule.blueprint(),  # default button_map: toggle=B, discard=Y
         G1CollectionRecorder.blueprint(
@@ -116,13 +117,19 @@ unitree_g1_teleop = (
             # Command/status streams have no tf frame to anchor a pose;
             # declaring them avoids a per-message no-pose warning at
             # teleop rates.
-            poseless_streams=["status", "coordinator_cartesian_command", "coordinator_joint_state"],
+            poseless_streams=[
+                "status",
+                "left_cartesian_command",
+                "right_cartesian_command",
+                "coordinator_joint_state",
+            ],
         ),
     )
     .remappings(
         [
-            (G1QuestTeleopModule, "left_controller_output", "coordinator_cartesian_command"),
-            (G1QuestTeleopModule, "right_controller_output", "coordinator_cartesian_command"),
+            (MobileVideoArmTeleopModule, "left_controller_output", "left_cartesian_command"),
+            (MobileVideoArmTeleopModule, "right_controller_output", "right_cartesian_command"),
+            (MobileVideoArmTeleopModule, "cmd_vel", "tele_cmd_vel"),
         ]
     )
     # Camera frames stay off the LCM bus: every consumer (quest module,
