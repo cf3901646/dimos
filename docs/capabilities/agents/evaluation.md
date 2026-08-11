@@ -1,10 +1,10 @@
 ---
-title: "CodePolicy evaluation"
+title: "Agent evaluation runtimes"
 ---
 
-# CodePolicy evaluation
+# Agent evaluation runtimes
 
-CodePolicy evaluations separate exploration from measured execution.
+Evaluations select the runtime that matches the benchmark condition.
 
 ```text
 Pi + Python REPL                           native Evaluation
@@ -17,6 +17,15 @@ Pi + Python REPL                           native Evaluation
                                       privileged native scorer
 ```
 
+`code-policy-v1` uses the flow above. `live-agent-v1` keeps Pi and the
+persistent Python workspace in the measured runtime loop:
+
+```text
+Pi + persistent Python ── observations and DimOS RPCs ── native Evaluation
+          │                                                   │
+          └──────── explicit terminal action ─────────────────┘
+```
+
 The existing `dimos evals` command and its passive and interactive cases remain
 unchanged. Complete benchmarks use the `Evaluation` interface and the
 `dimos eval` command.
@@ -26,8 +35,9 @@ unchanged. Complete benchmarks use the `Evaluation` interface and the
 An `Evaluation` owns its native environment, cases, seeds, blueprint lifecycle,
 step or real-time horizon, privileged scorer, aggregation, and native result.
 Built-in evaluations resolve in-repo; external packages may use the existing
-`dimos.evaluations` entry point. The shared runner provides a fixed CodePolicy
-runtime and publishes one immutable result directory.
+`dimos.evaluations` entry point. Each Evaluation declares `code-policy-v1` or
+`live-agent-v1`. The shared runner constructs that runtime and publishes one
+immutable result directory.
 
 The policy sees every capability exposed by its running blueprint through
 `Dimos`: modules, RPCs, skills, and streams. The scorer may use simulator-only
@@ -36,9 +46,9 @@ policy process, trial logs, or Memory2 recording.
 
 ## Exploration
 
-The fixed `code-policy-v1` profile runs Pi with `gpt-5.6-luna`, medium thinking,
-and one tool: `python_exec`. The persistent Python REPL contains `Dimos` and
-`submit_policy`.
+The `code-policy-v1` profile runs the model and thinking level pinned by the run
+specification with one tool: `python_exec`. The persistent Python REPL contains
+`Dimos` and `submit_policy`.
 
 ```python
 def policy(app: Dimos) -> None:
@@ -96,7 +106,11 @@ Run an installed Evaluation from a strict JSON specification:
 
 ```json
 {
-  "schema_version": "1.0",
+  "schema_version": "2.0",
+  "runtime": {
+    "model": "gpt-5.6-luna",
+    "thinking_level": "medium"
+  },
   "evaluation": {
     "name": "vendor-evals.benchmark-name",
     "config": {}
@@ -136,5 +150,20 @@ The left half is `agentview` and the right half is `robot0_eye_in_hand`. The
 video contains the post-settling initial observation followed by one frame for
 each simulator policy tick.
 
-The run specification has no agent or policy-mode fields. The runtime profile
-is fixed and recorded in `evaluation-run/run.json`.
+The run specification pins the model condition but cannot switch runtime
+profiles. The Evaluation owns that choice, and `evaluation-run/run.json`
+records both the requested condition and resolved profile.
+
+## Live-agent execution
+
+The `live-agent-v1` profile prepares one Pi session and one persistent Python
+workspace before the evaluator's start gate. The workspace provides `app` for
+ordinary DimOS RPCs and `memory` for read-only public observations. Pi can make
+repeated `python_exec` calls while the native environment advances. The native
+terminal condition or evaluator timeout stops Pi and closes the workspace.
+
+VLN-CE R2R uses this profile because navigation requires new decisions as
+observations arrive. Its checked-in case shares a 300-second wall-clock horizon
+between Habitat and Pi and ends only when the agent calls
+`app.VlnceConnection.submit_route()` or the horizon expires. See
+`dimos/benchmark/vlnce_r2r/README.md` for its condition and evidence contract.

@@ -26,6 +26,7 @@ class Config(BaseModel):
 
 class PluginEvaluation:
     name = "sample"
+    runtime_profile = "code-policy-v1"
     config_model: type[BaseModel] = Config
 
     def run(self, config: BaseModel, context: EvaluationContext) -> EvaluationReport:
@@ -82,6 +83,13 @@ def test_builtin_libero_pro_evaluation_resolves_in_repo() -> None:
     assert resolved.evaluation.name == "libero-pro"
 
 
+def test_builtin_vlnce_r2r_evaluation_resolves_with_live_agent() -> None:
+    resolved = registry.resolve_evaluation("vlnce-r2r")
+
+    assert resolved.provider == "dimos"
+    assert resolved.evaluation.runtime_profile == "live-agent-v1"
+
+
 def test_external_target_must_implement_whole_evaluation(monkeypatch) -> None:
     entry = EntryPoint(object())
     monkeypatch.setattr(
@@ -90,7 +98,7 @@ def test_external_target_must_implement_whole_evaluation(monkeypatch) -> None:
         lambda **_kwargs: [entry],
     )
 
-    with pytest.raises(registry.EvaluationRegistryError, match="name, config_model, and run"):
+    with pytest.raises(registry.EvaluationRegistryError, match="runtime_profile"):
         registry.resolve_evaluation("acme-evals.sample")
 
 
