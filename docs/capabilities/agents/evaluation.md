@@ -18,16 +18,16 @@ Pi + Python REPL                           native Evaluation
 ```
 
 The existing `dimos evals` command and its passive and interactive cases remain
-unchanged. Complete third-party benchmarks use the additive `Evaluation` plugin
-interface and the `dimos eval` command.
+unchanged. Complete benchmarks use the `Evaluation` interface and the
+`dimos eval` command.
 
 ## Evaluation ownership
 
 An `Evaluation` owns its native environment, cases, seeds, blueprint lifecycle,
 step or real-time horizon, privileged scorer, aggregation, and native result.
-External packages register an Evaluation through the `dimos.evaluations` entry
-point group. The shared runner resolves the plugin, provides a fixed CodePolicy
-runtime, and publishes one immutable result directory.
+Built-in evaluations resolve in-repo; external packages may use the existing
+`dimos.evaluations` entry point. The shared runner provides a fixed CodePolicy
+runtime and publishes one immutable result directory.
 
 The policy sees every capability exposed by its running blueprint through
 `Dimos`: modules, RPCs, skills, and streams. The scorer may use simulator-only
@@ -67,10 +67,15 @@ artifacts. It does not expose simulator state or scorer internals.
 
 The Evaluation reuses one task-level policy across all held-out cases. For each
 case it starts a fresh environment and policy-only blueprint, waits for DimOS to
-be ready, and invokes the serialized callable in a clean process:
+be ready, and loads the serialized callable in a clean process behind a start
+gate:
 
 ```python
-execution = context.runtime.execute(policy, timeout_s=case.timeout_s)
+execution = context.runtime.prepare(policy, startup_timeout_s=30.0)
+evaluator.start_trial()
+execution.start()
+terminal = evaluator.wait_for_terminal()
+policy_result = execution.finish()
 ```
 
 Pi and the production `McpClient` are absent from measured execution. The task
@@ -102,6 +107,34 @@ Run an installed Evaluation from a strict JSON specification:
 ```bash
 dimos eval run specification.json --output evaluation-run
 ```
+
+The in-repo LIBERO-PRO smoke case runs each debug submission and the scored
+trial in a fresh rootless Podman container and a fresh DimOS blueprint. Podman
+owns the pinned simulator environment; LIBERO is never imported into the host
+DimOS Python environment.
+
+```bash
+dimos eval run \
+  dimos/benchmark/libero_pro/cases/goal-task-0-single-trial/evaluation.json \
+  --output /tmp/dimos-libero-pro-smoke \
+  --json --quiet
+```
+
+A completed trial exits successfully whether its native score is `0.0` or
+`1.0`. Infrastructure and policy execution failures remain failed runs.
+
+Every debug submission and the scored trial records the two public camera
+streams side by side at 20 FPS. Debug videos live beside their corresponding
+trial diagnostics; the scored video is also listed in the evaluation report:
+
+```text
+runtime/exploration-0001/submission-0001/trial/trial.mp4
+scored-trial/trial.mp4
+```
+
+The left half is `agentview` and the right half is `robot0_eye_in_hand`. The
+video contains the post-settling initial observation followed by one frame for
+each simulator policy tick.
 
 The run specification has no agent or policy-mode fields. The runtime profile
 is fixed and recorded in `evaluation-run/run.json`.
