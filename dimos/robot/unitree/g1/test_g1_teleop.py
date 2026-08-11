@@ -70,6 +70,20 @@ def test_g1_blueprint_uses_shared_bimanual_teleop_task() -> None:
     assert task.params["max_joint_velocity_rad_s"] == pytest.approx(np.deg2rad(120.0))
 
 
+def test_g1_blueprint_has_no_static_arm_holder() -> None:
+    coordinator = next(
+        atom
+        for atom in unitree_g1_groot_wbc.blueprints
+        if issubclass(atom.module, TeleopControlCoordinator)
+    )
+
+    arm_tasks = [
+        task for task in coordinator.kwargs["tasks"] if set(task.joint_names) & set(g1_arms)
+    ]
+
+    assert [(task.name, task.type) for task in arm_tasks] == [(G1_TELEOP_TASK_NAME, "teleop_ik")]
+
+
 def test_g1_teleop_wires_arm_velocity_and_recording_streams() -> None:
     teleop_kwargs = _module_kwargs(unitree_g1_teleop, MobileVideoArmTeleopModule)
 

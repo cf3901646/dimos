@@ -53,7 +53,6 @@ from typing import Any, cast
 from dimos.control.components import HardwareComponent, HardwareType
 from dimos.control.coordinator import TaskConfig
 from dimos.control.tasks.g1_groot_wbc_task.g1_groot_wbc_task import (
-    ARM_DEFAULT_POSE,
     G1_GROOT_KD,
     G1_GROOT_KP,
     g1_arms,
@@ -283,14 +282,6 @@ if global_config.simulation == "mujoco":
     _default_ramp_seconds = 0.0
     _decimation: int | None = 1
     _n_workers = 2  # sim: keep the default worker count
-    _arm_holder = TaskConfig(
-        name="servo_arms",
-        type="servo",
-        joint_names=g1_arms,
-        priority=10,
-        auto_start=True,
-        params={"default_positions": ARM_DEFAULT_POSE},
-    )
     _mapper = VoxelGridMapper.blueprint(emit_every=1)
     _nav_stack = autoconnect(
         _mapper,
@@ -332,16 +323,6 @@ else:
     _decimation = 2  # 100 Hz tick / 2 = 50 Hz policy (training + sim rate).
     # One process per heavy module; fewer workers starve the Rerun bridge.
     _n_workers = 10
-    # Real hardware needs the arms held -- kd damping alone would let
-    # them sag toward singular configurations between trajectories.
-    _arm_holder = TaskConfig(
-        name="servo_arms",
-        type="servo",
-        joint_names=g1_arms,
-        priority=10,
-        auto_start=True,
-        params={"default_positions": ARM_DEFAULT_POSE},
-    )
     # Same nav middle as unitree-g1-nav-simple, fed by Point-LIO from the
     # MID-360, executed through the coordinator's twist_command.
     _nav_stack = autoconnect(
@@ -543,7 +524,6 @@ _coordinator = _G1GrootCoordinator.blueprint(
                 "decimation": _decimation,
             },
         ),
-        *([_arm_holder] if _arm_holder is not None else []),
         # Shared bimanual Quest task with G1-only model and objective tuning.
         TaskConfig(
             name=G1_TELEOP_TASK_NAME,
